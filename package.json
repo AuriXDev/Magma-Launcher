@@ -1,0 +1,53 @@
+{
+  "name": "mgl2",
+  "version": "2.0.0",
+  "description": "Magma Launcher",
+  "main": "scripts/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "electron-builder --win nsis --x64"
+  },
+  "author": "Magma Launcher",
+  "license": "MIT",
+  "build": {
+    "appId": "com.magmalauncher.mgl2",
+    "productName": "Magma Launcher",
+    "electronVersion": "28.3.3",
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "index.html",
+      "package.json",
+      "scripts/**/*",
+      "styles/**/*",
+      "assets/**/*",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      { "from": "assets/icon.ico", "to": "icon.ico" },
+      { "from": "PLUGINS.md", "to": "PLUGINS.md" }
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "assets/icon.ico",
+      "artifactName": "MagmaLauncher-Setup-${version}.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Magma Launcher",
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "deleteAppDataOnUninstall": false
+    }
+  },
+  "devDependencies": {
+    "electron": "28.3.3",
+    "electron-builder": "^26.15.3"
+  }
+}
