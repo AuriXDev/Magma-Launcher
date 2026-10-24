@@ -66,7 +66,7 @@
   "style": "style.css",
   "icon": "icon.png",
   "homepage": "https://github.com/me/my-plugin",
-  "minLauncher": "2.0.0"
+  "minLauncher": "2.0.1"
 }
 ```
 
@@ -78,7 +78,7 @@
 | `author`, `description`, `homepage` | нет | показываются в списке |
 | `main` / `renderer` / `style` | нет | пути к файлам внутри папки. Если не указаны, но в папке есть `main.js` / `renderer.js` / `style.css` — подхватятся сами. |
 | `icon` | нет | PNG/JPG/SVG внутри папки (квадрат, ~64×64). Без иконки генерируется абстрактная. |
-| `minLauncher` | нет | минимальная версия лаунчера (`package.json → version`, сейчас `2.0.0`). На старых версиях плагин не запустится. |
+| `minLauncher` | нет | минимальная версия лаунчера (`package.json → version`, сейчас `2.0.1`). На старых версиях плагин не запустится. |
 
 Пути не могут выходить за пределы папки плагина.
 

@@ -8,6 +8,9 @@
   <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles/style.css">
   <script src="scripts/themes.js"></script>
+  <script src="scripts/i18n-en.js"></script>
+  <script src="scripts/i18n.js"></script>
+  <script src="scripts/a11y.js"></script>
 </head>
 <body>
   <div class="splash" id="splash">
@@ -70,6 +73,7 @@
           <div class="nav-link" data-view="mycontent"><span>Мой контент</span></div>
           <div class="nav-link" data-view="browse"><span>Браузер контента</span></div>
           <div class="nav-link" data-view="library"><span>Библиотека</span></div>
+          <div class="nav-link" data-view="packs"><span>Сборки</span></div>
           <div class="nav-link" data-view="servers"><span>Серверы</span></div>
           <div class="nav-link" data-view="skins"><span>Скины</span></div>
           <div class="nav-link" data-view="sessions"><span>Активные сессии</span><span class="nav-count" id="sidebar-session-count"></span></div>
@@ -83,7 +87,7 @@
     </div>
     <div class="main">
       <div class="topbar" id="title-bar">
-        <div class="breadcrumb">Magma Launcher · <b id="breadcrumb-current">Главная</b></div>
+        <div class="breadcrumb"><span id="breadcrumb-brand">Magma Launcher</span> · <b id="breadcrumb-current">Главная</b></div>
         <div class="topbar-actions">
           <div class="icon-btn" id="notif-btn" title="Уведомления">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
@@ -92,8 +96,9 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1-1.6 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 112.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.6-1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.6 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.6 1z"/></svg>
           </div>
           <div class="win-controls">
-            <div class="icon-btn" id="minimize-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></div>
-            <div class="icon-btn" id="close-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></div>
+            <div class="icon-btn" id="minimize-btn" title="Свернуть окно"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></div>
+            <div class="icon-btn" id="maximize-btn" title="Развернуть" role="button" tabindex="0" aria-label="Развернуть окно"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg></div>
+            <div class="icon-btn" id="close-btn" title="Закрыть окно"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></div>
           </div>
         </div>
       </div>
@@ -142,8 +147,10 @@
               <button class="account-btn primary" id="acc-mgl-login">Войти</button>
               <button class="account-btn ghost" id="acc-mgl-offline">Продолжить как оффлайн</button>
             </div>
+            <button class="account-btn ghost account-register" id="acc-mgl-register" title="Telegram-бот @mglauncherbot">
+              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M21.9 4.3 18.7 19.4c-.2 1-.9 1.3-1.8.8l-4.9-3.6-2.4 2.3c-.3.3-.5.5-1 .5l.3-5 9.2-8.3c.4-.4-.1-.6-.6-.2L6.1 13.1 1.2 11.6c-1-.3-1.1-1 .2-1.5L20.6 2.7c.9-.3 1.6.2 1.3 1.6z"/></svg>
+              Нет аккаунта? Зарегистрироваться в @mglauncherbot</button>
           </div>
-          <div class="account-hint">MGL - свой аккаунт лаунчера: синхронизация скинов, плащей и сборок между устройствами (скоро).</div>
         </div>
         <div class="account-pane hidden" data-pane="mojang">
           <div class="account-field"><label>Email Microsoft/Mojang</label>
@@ -176,6 +183,10 @@
     <button class="ctx-item" data-act="reset-icon" data-reset-icon-item>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 2.6-6.4M3 3v6h6"/></svg>
       <span>Сбросить иконку</span>
+    </button>
+    <button class="ctx-item" data-act="java">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 10h11v4a5 5 0 0 1-5 5h-1a5 5 0 0 1-5-5z"/><path d="M17 11h1.5a2.5 2.5 0 0 1 0 5H17M9 3c-1 1.5 1 2.5 0 4M13 3c-1 1.5 1 2.5 0 4"/></svg>
+      <span>Java для сборки</span><span class="ctx-note" data-java-note></span>
     </button>
     <button class="ctx-item" data-act="reinstall">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6"/></svg>
@@ -240,7 +251,9 @@
   <script src="scripts/vendor/skinview3d.bundle.js"></script>
   <script src="scripts/obj-scene.js"></script>
   <script src="scripts/custom-select.js"></script>
+  <script src="scripts/seasonal.js"></script>
   <script src="scripts/ui.js"></script>
+  <script src="scripts/packs.js"></script>
   <script src="scripts/plugins.js"></script>
 </body>
 </html>

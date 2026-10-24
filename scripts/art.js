@@ -79,13 +79,46 @@
     return 'data:image/svg+xml,' + encodeURIComponent(svg(seed, size));
   }
   window.MglArt = { svg, dataUrl, refreshPalette() { PAL = palette(); } };
+  // Свои картинки сборок (Библиотека). В приложении лежат файлами в <.minecraft>/mgl/icons (main: icons:*),
+  // в браузере-превью (без Electron) - по-прежнему в localStorage. Кэш в памяти → get/for остаются синхронными.
   const KEY = 'mgl.icons';
-  const read = () => { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } };
-  const write = (o) => { try { localStorage.setItem(KEY, JSON.stringify(o)); } catch (e) {} };
+  const lsRead = () => { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } };
+  const lsWrite = (o) => { try { localStorage.setItem(KEY, JSON.stringify(o)); } catch (e) {} };
+  const ipcR = (() => { try { return window.require ? window.require('electron').ipcRenderer : null; } catch (e) { return null; } })();
+  let cache = null;
+  function load() {
+    if (cache) return cache;
+    if (!ipcR) return (cache = lsRead());
+    try { cache = ipcR.sendSync('icons:loadAll') || {}; } catch (e) { cache = {}; }
+    // одноразовый перенос старых картинок из localStorage на диск
+    try {
+      const old = lsRead();
+      if (Object.keys(old).length) {
+        const r = ipcR.sendSync('icons:migrate', old);
+        if (r) {
+          Object.assign(cache, r.urls || {});
+          if (!r.failed) localStorage.removeItem(KEY);
+        }
+      }
+    } catch (e) {}
+    return cache;
+  }
   window.MglIcons = {
-    get(id) { return read()[id] || null; },
-    set(id, url) { const o = read(); o[id] = url; write(o); },
-    clear(id) { const o = read(); delete o[id]; write(o); },
+    get(id) { return load()[id] || null; },
+    set(id, url) {
+      const c = load();
+      if (!ipcR) { c[id] = url; lsWrite(c); return; }
+      let saved = null;
+      try { saved = ipcR.sendSync('icons:save', id, url); } catch (e) {}
+      c[id] = saved || url;      // не удалось записать на диск - хотя бы показываем в этой сессии
+    },
+    clear(id) {
+      const c = load();
+      delete c[id];
+      if (ipcR) { try { ipcR.sendSync('icons:remove', id); } catch (e) {} } else lsWrite(c);
+    },
+    // после смены папки .minecraft - перечитать с диска
+    reload() { cache = null; load(); },
     // иконка сборки: своя картинка, иначе сгенерированная абстракция
     for(id) { return this.get(id) || dataUrl(id); }
   };

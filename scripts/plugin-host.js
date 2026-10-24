@@ -303,7 +303,7 @@ class PluginHost {
     const arr = (this.errors.get(id) || []).filter(t => now - t < ERR_WINDOW_MS);
     arr.push(now); this.errors.set(id, arr);
     if (fatal || arr.length >= ERR_LIMIT) {
-      const reason = fatal ? `Сбой (${phase}): ${(err && err.message) || err}` : `${arr.length} ошибки за минуту (последняя — ${phase})`;
+      const reason = fatal ? `Сбой (${phase}): ${(err && err.message) || err}` : `${arr.length} ошибки за минуту (последняя - ${phase})`;
       const log = this.writeCrash('plugin-' + id, { plugin: id, phase, error: msg });
       this.disablePlugin(id, reason, log);
     }

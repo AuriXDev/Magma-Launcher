@@ -270,7 +270,9 @@
         const body = card.querySelector('.plugin-card-body');
         guard(pid, 'settings:render', () => { body.innerHTML = def.render ? (def.render() || '') : ''; })();
         if (def.mount) guard(pid, 'settings:mount', () => def.mount(body, (active.get(pid) || {}).api))();
-        view && view.appendChild(card);
+        // перед карточкой «Спасибо…», иначе плагинные блоки липнут к ней снизу
+        const thanks = view && view.querySelector(':scope > .thanks-card');
+        if (thanks) view.insertBefore(card, thanks); else if (view) view.appendChild(card);
       });
     }
     if (name === 'plugins') bindPluginsView(root);
@@ -380,11 +382,11 @@
         <div class="page-head page-head-row"><div><div class="page-title">Плагины</div>
           <div class="page-sub">Расширения с полным доступом к лаунчеру · ${list.length ? `${list.length} установлено, ${nOn} включено` : 'пока ни одного'}</div></div>
           <button class="btn-secondary" id="pl-docs">${PIC.book} Как писать плагины</button></div>
-        ${!ipc ? `<div class="plugin-banner info">${U.I.info}<div><b>Превью в браузере.</b> Плагины загружаются только в приложении — ниже демонстрационный список.</div></div>` : ''}
+        ${!ipc ? `<div class="plugin-banner info">${U.I.info}<div><b>Превью в браузере.</b> Плагины загружаются только в приложении - ниже демонстрационный список.</div></div>` : ''}
         ${auto ? `
         <div class="plugin-banner crash">${U.I.warn}
           <div class="pb-text"><b>Плагин-система отключилась автоматически</b>
-            <div>${esc(auto.reason)} · ${new Date(auto.ts).toLocaleString('ru-RU')}</div>
+            <div>${esc(auto.reason)} · ${new Date(auto.ts).toLocaleString(MGL_LOCALE)}</div>
             <div class="pb-hint">Лог сбоя сохранён. Проверьте плагины, затем включите систему снова.</div></div>
           <div class="pb-actions">
             ${auto.log ? `<button class="btn-secondary" id="pl-auto-log">Лог сбоя</button>` : ''}
@@ -409,7 +411,7 @@
         <div class="plugin-list ${state.enabled ? '' : 'sys-off'}" id="pl-list">
           ${list.length ? list.map(pluginRow).join('') : `
           <div class="empty sm">${PIC.plug}<div>Плагинов пока нет</div>
-            <div class="empty-sub">Нажмите «Создать плагин» — появится рабочий пример, который можно править.</div></div>`}
+            <div class="empty-sub">Нажмите «Создать плагин» - появится рабочий пример, который можно править.</div></div>`}
         </div>
         ${recentLog.length ? `<div class="section"><div class="section-head"><div class="section-title">Последние ошибки</div></div>
           <pre class="plugin-log sm">${esc(recentLog.slice(-8).join('\n'))}</pre></div>` : ''}
@@ -481,7 +483,7 @@
   }
   async function openDocs() {
     let text = '';
-    try { text = ipc ? await ipc.invoke('plugins:readDocs') : await (await fetch('PLUGINS.md')).text(); } catch (e) {}
+    try { text = ipc ? await ipc.invoke('plugins:readDocs') : await (await fetch('https://raw.githubusercontent.com/AuriXDev/Magma-Launcher/main/docs/PLUGINS.md')).text(); } catch (e) {}
     const wrap = U.showModal({
       title: 'Как писать плагины', okText: 'Закрыть', wide: true,
       bodyHtml: `<div class="md-doc">${text ? mdToHtml(text) : '<div class="empty sm">Файл PLUGINS.md не найден</div>'}</div>`,
@@ -636,7 +638,7 @@
     ipc.on('plugins:notify', (e, d) => U.notify({ kind: 'plugin', title: d.title || d.id, text: d.text || '', view: 'plugins' }));
     ipc.on('plugins:settingsChanged', (e, patch) => { U.D.settings = { ...(U.D.settings || {}), ...(patch || {}) }; });
     ipc.on('plugins:logLine', (e, d) => {
-      recentLog.push(`[${new Date().toLocaleTimeString('ru-RU')}] ${d.level.toUpperCase()} ${d.id || 'host'}: ${String(d.text).split('\n')[0]}`);
+      recentLog.push(`[${new Date().toLocaleTimeString(MGL_LOCALE)}] ${d.level.toUpperCase()} ${d.id || 'host'}: ${String(d.text).split('\n')[0]}`);
       if (recentLog.length > 50) recentLog.shift();
     });
     state = await ipc.invoke('plugins:list');
@@ -645,7 +647,7 @@
   }
   function previewState() {
     return {
-      enabled: true, autoDisabled: null, root: '%APPDATA%\\magma-launcher\\plugins', logsDir: '', launcherVersion: '2.0.0',
+      enabled: true, autoDisabled: null, root: '%APPDATA%\\magma-launcher\\plugins', logsDir: '', launcherVersion: '2.0.1',
       plugins: [
         { id: 'discord-rpc', folder: 'discord-rpc', name: 'Discord Rich Presence', version: '1.2.0', author: 'MGL Team', description: 'Показывает в Discord, во что вы играете.', enabled: true, hasMain: true, hasRenderer: true, mainActive: true },
         { id: 'auto-backup', folder: 'auto-backup', name: 'Авто-бэкап миров', version: '0.4.1', author: 'someone', description: 'Копирует saves/ после выхода из игры.', enabled: false, hasMain: true },

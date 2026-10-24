@@ -4,7 +4,12 @@
   const D = window.MGL_DATA;
   const content = document.getElementById('content');
   const LOADER = { vanilla: 'Vanilla', forge: 'Forge', fabric: 'Fabric', neoforge: 'NeoForge', quilt: 'Quilt' };
-  const verLabel = (f) => String(f || '').replace(/^[[^]]*]s*/, '');
+  // «[1.20.1] fabric-loader-…» → «fabric-loader-…»; «inst:<id>» (процесс сборки) → название сборки
+  const verLabel = (f) => {
+    const s = String(f || '');
+    if (s.startsWith('inst:')) { const p = (D.packs || []).find(x => 'inst:' + x.id === s); return p ? p.name : s.slice(5); }
+    return s.replace(/^\[[^\]]*\]\s*/, '');
+  };
 
   const I = {
     warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>',
@@ -33,7 +38,7 @@
   const artFor = (seed) => window.MglArt ? MglArt.dataUrl(seed) : 'assets/icons/icon.png';
 
   const TITLES = {
-    home: 'Главная', news: 'Новости', mycontent: 'Мой контент', browse: 'Браузер контента', library: 'Библиотека',
+    home: 'Главная', news: 'Новости', mycontent: 'Мой контент', browse: 'Браузер контента', library: 'Библиотека', packs: 'Сборки', pack: 'Сборка',
     servers: 'Серверы', sessions: 'Активные сессии', skins: 'Скины', settings: 'Настройки', plugins: 'Плагины'
   };
 
@@ -47,7 +52,7 @@
 
   const NEWS_URL = 'https://gist.githubusercontent.com/AuriXDev/664e23438029adb3993d89fa2213dbfe/raw/data.json';
   const NEWS_REFRESH_MS = 20 * 60 * 1000;
-  const LAUNCHER_VERSION = '2.0';
+  const LAUNCHER_VERSION = '2.0.1';
   let _newsItems = [];
   let _newsLoaded = false;
   let _remoteMeta = { latestVersion: null, updateRepo: null };
@@ -90,8 +95,43 @@
     } catch (e) { console.warn('fetchNews failed', e); }
     return _newsItems;
   }
+  // '2.0.10' > '2.0.9'; префикс «v» и хвосты вроде «-beta» игнорируются
+  function cmpAppVer(a, b) {
+    const pa = String(a || '').replace(/^v/i, '').split(/[.\-+]/).map(x => parseInt(x, 10) || 0);
+    const pb = String(b || '').replace(/^v/i, '').split(/[.\-+]/).map(x => parseInt(x, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d) return d > 0 ? 1 : -1;
+    }
+    return 0;
+  }
   function isUpdateAvailable() {
-    return !!_remoteMeta.latestVersion && _remoteMeta.latestVersion !== LAUNCHER_VERSION;
+    return !!_remoteMeta.latestVersion && cmpAppVer(_remoteMeta.latestVersion, LAUNCHER_VERSION) > 0;
+  }
+  // Сплеш: сверка с последним релизом GitHub; есть новее → качаем с прогрессом на сплеше и запускаем установщик.
+  // true = установщик запущен (лаунчер сейчас закроется).
+  async function splashAutoUpdate() {
+    const ipc = getIpc();
+    if (!ipc) return false;
+    Splash.step(60, 'Проверка обновлений…');
+    let info = null;
+    try { info = await ipc.invoke('update:check', { repo: _remoteMeta.updateRepo }); } catch (e) {}
+    if (!info || !info.ok || !info.hasExe) return false;
+    if (cmpAppVer(info.version, LAUNCHER_VERSION) <= 0) return false;
+    _remoteMeta.latestVersion = info.version;
+    if (!info.packaged) { console.info('[update] dev-запуск: найдено', info.tag, '- автоустановка пропущена'); return false; }
+    Splash.setUpdating(true);
+    Splash.step(0, `Найдено обновление ${info.tag} - скачивание…`);
+    const onProg = (e, d) => Splash.step(d.progress || 0, `Обновление ${info.tag}: ${d.status || ''} ${d.progress != null ? d.progress + '%' : ''}`.trim());
+    ipc.on('update:progress', onProg);
+    let r = null;
+    try { r = await ipc.invoke('update:download', { repo: _remoteMeta.updateRepo }); } catch (e) { r = { ok: false, error: e.message }; }
+    ipc.removeListener('update:progress', onProg);
+    if (r && r.ok) { Splash.step(100, 'Запуск установщика…'); return true; }
+    Splash.setUpdating(false);
+    Splash.step(85, 'Не удалось обновиться - продолжаю запуск');
+    setTimeout(() => toast('Ошибка обновления: ' + ((r && r.error) || 'неизвестно')), 1500);
+    return false;
   }
   function startNewsAutoRefresh() {
     setInterval(async () => {
@@ -173,6 +213,61 @@
       </div>`;
   }
 
+  // ---- «Уже установлено» в карточках браузера: по индексу контента (modrinth:listInstalled) ----
+  // projectId/slug → [{ gameVersions, loaders, versionNumber, disabled }]
+  function installedIndex(list) {
+    const m = new Map();
+    (list || []).forEach(x => {
+      const e = { gameVersions: Array.isArray(x.gameVersions) ? x.gameVersions : null, loaders: x.loaders || [], versionNumber: x.versionNumber || '', disabled: /\.disabled$/i.test(x.filename || '') };
+      [x.projectId, x.slug].filter(Boolean).forEach(k => { if (!m.has(k)) m.set(k, []); m.get(k).push(e); });
+    });
+    return m;
+  }
+  // f = { gameVersion, loader } - фильтр браузера / версия сборки. match = стоит именно под эту версию
+  function installStatus(h, map, f) {
+    const entries = map.get(h.project_id) || map.get(h.slug);
+    if (!entries || !entries.length) return null;
+    const uniq = (a) => Array.from(new Set(a));
+    const loaderOk = (e) => !f.loader || !e.loaders.length || e.loaders.includes(f.loader) || (f.loader === 'quilt' && e.loaders.includes('fabric'));
+    const known = entries.filter(e => e.gameVersions);
+    const vers = uniq(known.map(e => e.gameVersions[e.gameVersions.length - 1]).filter(Boolean));
+    const off = (e) => e && e.disabled ? ' (отключён)' : '';
+    if (!f.gameVersion) return { match: true, text: 'Установлено' + (vers.length ? ' · для ' + vers.join(', ') : '') + off(entries[0]) };
+    const hit = known.find(e => e.gameVersions.includes(f.gameVersion) && loaderOk(e));
+    if (hit) return { match: true, text: `Установлено для ${f.gameVersion}${hit.versionNumber ? ' · ' + hit.versionNumber : ''}${off(hit)}` };
+    if (known.length) return { match: false, text: 'Установлен для другой версии: ' + vers.join(', ') };
+    return { match: false, text: 'Установлен (версия неизвестна)' };
+  }
+  const I_CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-10"/></svg>';
+  function decorateInstalled(grid, hits, map, f) {
+    if (!grid || !map) return;
+    grid.querySelectorAll('.mod-card[data-mr-slug]').forEach(card => {
+      const h = hits.find(x => (x.slug || x.project_id) === card.dataset.mrSlug);
+      const st = h ? installStatus(h, map, f || {}) : null;
+      card.classList.toggle('is-installed', !!(st && st.match));
+      const old = card.querySelector('.mod-card-installed');
+      if (old) old.remove();
+      if (!st) return;
+      const div = document.createElement('div');
+      div.className = 'mod-card-installed' + (st.match ? '' : ' other');
+      div.innerHTML = (st.match ? I_CHECK : I.info) + `<span>${escapeHtml(st.text)}</span>`;
+      const actions = card.querySelector('.mod-card-actions');
+      if (actions) actions.before(div); else card.appendChild(div);
+      const btn = card.querySelector('[data-mr-install]');
+      if (btn && st.match && !btn.disabled) { btn.textContent = 'Переустановить'; btn.classList.remove('primary'); btn.classList.add('btn-secondary'); }
+    });
+  }
+  // список установленного (+ разовая дозагрузка версий для старых записей индекса)
+  const _backfilled = new Set();
+  async function fetchInstalledIndex(projectType, instance) {
+    const ipc = getIpc();
+    if (!ipc || projectType === 'modpack') return new Map();
+    const key = instance || '';
+    if (!_backfilled.has(key)) { _backfilled.add(key); await ipc.invoke('modrinth:backfill', { instance }).catch(() => {}); }
+    const list = await ipc.invoke('modrinth:listInstalled', { projectType, instance }).catch(() => []);
+    return installedIndex(list);
+  }
+
   const BROWSE_PAGE_SIZE = 30;
   const browseState = {
     projectType: 'mod',
@@ -198,6 +293,7 @@
     if (!grid) return;
     grid.innerHTML = browseState.hits.map(modrinthCard).join('');
     bindBrowseCardActions();
+    decorateInstalled(grid, browseState.hits, browseState.installed, browseFilterNow());
     if (statusEl) {
       if (browseState.loading && !browseState.hits.length) statusEl.textContent = 'Поиск на Modrinth…';
       else if (!browseState.hits.length) statusEl.textContent = 'Ничего не найдено. Попробуйте изменить фильтры.';
@@ -234,6 +330,7 @@
     const myReq = ++browseState._reqId;
     browseState.loading = true;
     renderBrowseList();
+    if (!append) fetchInstalledIndex(browseState.projectType).then(m => { if (myReq === browseState._reqId) { browseState.installed = m; renderBrowseList(); } });
     ipc.invoke('modrinth:search', {
       query: browseState.query,
       projectType: browseState.projectType,
@@ -304,11 +401,8 @@
         return;
       }
       Downloads.finish(taskId, { ok: true });
-      if (btn.isConnected) {
-        btn.textContent = 'Установлено';
-        btn.classList.remove('primary');
-        btn.classList.add('btn-secondary');
-      }
+      if (btn.isConnected) btn.textContent = 'Установлено';
+      fetchInstalledIndex(browseState.projectType).then(m => { browseState.installed = m; if (currentView === 'browse') renderBrowseList(); });
       const deps = res.deps || [];
       toast('Установлено: ' + res.filename + (deps.length ? ` · + зависимости: ${deps.map(d => d.title).join(', ')}` : '')
         + ((res.skipped || []).length ? ` · уже стоят: ${res.skipped.join(', ')}` : ''));
@@ -318,6 +412,9 @@
       if (btn.isConnected) { btn.disabled = false; btn.textContent = orig; }
       toast('Ошибка: ' + err.message);
     });
+  }
+  function browseFilterNow() {
+    return { gameVersion: browseState.gameVersion, loader: browseState.projectType === 'mod' ? browseState.loader : '' };
   }
   function onBrowseScroll() {
     if (currentView !== 'browse') return;
@@ -445,11 +542,44 @@
           <div class="server-console" data-console></div>
           <div class="server-cmd">
             <span class="cmd-prompt">&gt;</span>
-            <input type="text" class="cmd-input" placeholder="Команда сервера (say, op, list, whitelist…) — ↑/↓ история">
+            <input type="text" class="cmd-input" placeholder="Команда сервера (say, op, list, whitelist…) - ↑/↓ история">
             <button class="btn sm primary cmd-send">Отправить</button>
           </div>
         </div>
       </div>`;
+  }
+
+  // Новости приходят с сервера на русском; если в записи есть title_en / desc_en - в английском режиме показываем их
+  function newsText(n, field) {
+    return (window.MglI18n && MglI18n.lang === 'en' && n[field + '_en']) || n[field] || '';
+  }
+
+  // Кнопки в пустых состояниях: [действие, html, primary?]; обрабатываются одним делегатом (emptyAction)
+  function emptyBtns(list) {
+    return `<div class="empty-actions">${list.map(([act, html, primary]) =>
+      `<button type="button" class="btn ${primary ? 'primary ' : ''}sm" data-empty-act="${act}">${html}</button>`).join('')}</div>`;
+  }
+  // «Новая сессия» = к карточке «Запуск игры» на главной (при необходимости сразу открыть выбор версии)
+  function goNewSession(openPicker) {
+    if (currentView !== 'home') setView('home');
+    setTimeout(() => {
+      const card = content.querySelector('.launch-card');
+      if (card) {
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        card.classList.remove('pulse'); void card.offsetWidth; card.classList.add('pulse');
+        setTimeout(() => card.classList.remove('pulse'), 1800);
+      }
+      if (openPicker) { const p = document.getElementById('launch-version-pick'); if (p) setTimeout(() => p.click(), 350); }
+    }, 80);
+  }
+  function emptyAction(act) {
+    if (act === 'new-session') goNewSession(false);
+    else if (act === 'install-version') goNewSession(true);
+    else if (act === 'browse') setView('browse');
+    else if (act === 'create-pack') {
+      setView('packs');
+      if (window.MglPacks) window.MglPacks.create(); else toast('Сборки недоступны');
+    }
   }
 
   function launchSection() {
@@ -504,7 +634,7 @@
 
       const sessionsBlock = (D.sessions && D.sessions.length)
         ? D.sessions.map(sessionRow).join('')
-        : `<div class="empty sm">${I.box}<div>Нет активных сессий</div></div>`;
+        : `<div class="empty sm">${I.box}<div>Нет активных сессий</div>${emptyBtns([['new-session', `${I.play} Новая сессия`, true]])}</div>`;
 
       const heroViz = HeroViz.wanted();
       const heroScene = heroViz ? null : HeroScenes.mode();
@@ -517,7 +647,7 @@
           <div class="hero-noise"></div>
           <button class="hero-servers-btn" id="hero-servers-btn" title="Недавние серверы">${I.arrow}</button>
           <div class="srv-pop hidden" id="srv-pop"></div>
-          ${heroScene === 'snake' ? '<div class="hero-score"><span>Рекорд <b id="hs-best">0</b></span><span>Счёт <b id="hs-score">0</b></span></div>' : ''}
+          <div class="hero-score"></div>
           <div class="hero-body">
             <div>${heroBlock}</div>
             ${heroPlay}
@@ -569,7 +699,7 @@
           <input type="file" id="mc-file" multiple hidden accept="${_myContentType === 'mod' ? '.jar' : '.zip'}">
         </div>
         <div id="mc-drop" class="mc-drop" title="Перетащите файлы сюда">
-          ${I.dl}<div><b>Перетащите файлы сюда</b><span>${_myContentType === 'mod' ? '.jar-файлы модов' : _myContentType === 'resourcepack' ? '.zip-файлы ресурспаков' : '.zip-файлы шейдеров'} — копируются в папку автоматически</span></div>
+          ${I.dl}<div><b>Перетащите файлы сюда</b><span>${_myContentType === 'mod' ? '.jar-файлы модов' : _myContentType === 'resourcepack' ? '.zip-файлы ресурспаков' : '.zip-файлы шейдеров'} - копируются в папку автоматически</span></div>
         </div>
         <div id="mycontent-status" class="browse-status">Загрузка…</div>
         <div id="mycontent-list" class="mycontent-list"></div>
@@ -624,7 +754,7 @@
     library() {
       const list = (D.instances && D.instances.length)
         ? D.instances.map(i => libRow(i, true)).join('')
-        : `<div class="empty">${I.box}<div>Нет установленных сборок</div></div>`;
+        : `<div class="empty">${I.box}<div>Нет установленных версий</div><div class="empty-sub">Установите версию Minecraft или создайте сборку со своими модами</div>${emptyBtns([['install-version', `${I.dl} Установить версию`, true], ['create-pack', `${I.plus} Создать сборку`]])}</div>`;
       return `
       <div class="view">
         <div class="page-head"><div class="page-title">Библиотека</div>
@@ -637,7 +767,7 @@
     sessions() {
       const list = (D.sessions && D.sessions.length)
         ? D.sessions.map(sessionRow).join('')
-        : `<div class="empty">${I.box}<div>Нет активных сессий</div><div class="empty-sub">Запущенные экземпляры игры будут отображаться здесь</div></div>`;
+        : `<div class="empty">${I.box}<div>Нет активных сессий</div><div class="empty-sub">Запущенные экземпляры игры будут отображаться здесь</div>${emptyBtns([['new-session', `${I.play} Новая сессия`, true]])}</div>`;
       return `
       <div class="view">
         <div class="page-head"><div class="page-title">Активные сессии</div>
@@ -657,6 +787,12 @@
           <div class="skin-preview">
             <div class="skin-stage" id="skin-stage"><canvas id="skin-canvas"></canvas></div>
             <div class="skin-name" id="skin-active-name">-</div>
+            <div class="account-tabs skin-model-tabs" id="skin-model-tabs" title="Тип модели: Classic - руки 4 px (Steve), Slim - 3 px (Alex)">
+              <button class="account-tab" data-skin-model="auto">Авто</button>
+              <button class="account-tab" data-skin-model="classic">Classic</button>
+              <button class="account-tab" data-skin-model="slim">Slim</button>
+            </div>
+            <div class="skin-model-hint" id="skin-model-hint"></div>
             <div class="skin-actions">
               <button class="btn" id="skin-upload-btn">Добавить ▾</button>
               <button class="btn primary" id="skin-apply-btn">Применить</button>
@@ -706,14 +842,23 @@
       <div class="view">
         <div class="page-head page-head-row"><div><div class="page-title">Настройки</div>
           <div class="page-sub">Параметры запуска и внешнего вида · нажмите на заголовок блока, чтобы свернуть</div></div>
-          <button class="btn-secondary" id="sc-toggle-all">Свернуть всё</button></div>
+          <div class="head-tools">
+            <label class="lang-pick" title="Язык / Language"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+              <select id="set-lang" aria-label="Language">${[['auto', 'Auto (system)'], ['ru', 'Русский'], ['en', 'English']]
+                .map(([v, l]) => `<option value="${v}" ${((s.language) || 'auto') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+            <button class="btn-secondary" id="sc-toggle-all">Свернуть всё</button></div></div>
         <div class="settings-card update-card">
-          <div>
-            <div class="update-title">Magma Launcher <span class="update-ver">v${LAUNCHER_VERSION}</span></div>
-            <div class="update-sub" id="upd-sub">${isUpdateAvailable() ? `Доступна версия ${escapeHtml(_remoteMeta.latestVersion)}` : 'Нажмите, чтобы сверить версию с сервером'}</div>
+          <div class="update-top">
+            <div>
+              <div class="update-title">Magma Launcher <span class="update-ver">v${LAUNCHER_VERSION}</span></div>
+              <div class="update-sub" id="upd-sub">${isUpdateAvailable() ? `Доступна версия ${escapeHtml(_remoteMeta.latestVersion)}` : 'Нажмите, чтобы сверить версию с сервером'}</div>
+            </div>
+            <button class="btn-secondary update-btn ${isUpdateAvailable() ? 'glow' : ''}" id="upd-btn">${isUpdateAvailable() ? 'Скачать обновление' : 'Проверить обновления'}</button>
           </div>
           <div class="update-actions">
-            <button class="btn-secondary update-btn ${isUpdateAvailable() ? 'glow' : ''}" id="upd-btn">${isUpdateAvailable() ? 'Скачать обновление' : 'Проверить обновления'}</button>
+            <button class="btn-secondary icon-link" data-link="https://t.me/mglauncher" title="Telegram-канал @mglauncher" aria-label="Telegram"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21.9 4.3 18.7 19.4c-.2 1-.9 1.3-1.8.8l-4.9-3.6-2.4 2.3c-.3.3-.5.5-1 .5l.3-5 9.2-8.3c.4-.4-.1-.6-.6-.2L6.1 13.1 1.2 11.6c-1-.3-1.1-1 .2-1.5L20.6 2.7c.9-.3 1.6.2 1.3 1.6z"/></svg><span>Канал</span></button>
+            <button class="btn-secondary icon-link" data-link="https://github.com/AuriXDev/Magma-Launcher/blob/main/docs/PRIVACY_POLICY.md" title="Политика конфиденциальности"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/></svg><span>Конфиденциальность</span></button>
+            <button class="btn-secondary icon-link" data-link="https://github.com/AuriXDev/Magma-Launcher/blob/main/docs/TERMS_OF_SERVICE.md" title="Условия использования"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/></svg><span>Условия</span></button>
             <button class="btn-secondary icon-link" data-link="https://aurixdev.github.io/mgl/" title="Сайт" aria-label="Сайт"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></button>
             <button class="btn-secondary icon-link" data-link="https://github.com/AuriXDev/Magma-Launcher" title="GitHub" aria-label="GitHub"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.54-3.87-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.04-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.78 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.7 5.4-5.27 5.69.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg></button>
           </div>
@@ -734,14 +879,14 @@
               <button type="button" class="btn-secondary" id="set-java-browse">Обзор…</button>
               <button type="button" class="btn-ghost" id="set-java-clear" title="Очистить">×</button>
             </div></div>
-          <div class="field"><label class="field-label">Установка Java — Eclipse Temurin (Adoptium)</label>
+          <div class="field"><label class="field-label">Установка Java - Eclipse Temurin (Adoptium)</label>
             <div class="field-row" style="gap:8px; flex-wrap:wrap">
               <button type="button" class="btn-secondary" data-java-install="8">Java 8</button>
               <button type="button" class="btn-secondary" data-java-install="17">Java 17</button>
               <button type="button" class="btn-secondary" data-java-install="21">Java 21</button>
               <button type="button" class="btn-secondary" data-java-install="25">Java 25</button>
             </div>
-            <div class="field-hint">Лаунчер скачает официальный установщик и откроет его. Путь по умолчанию — <code class="path">C:\Program Files\Eclipse Adoptium\</code>; именно оттуда Java подбирается в первую очередь.</div>
+            <div class="field-hint">Лаунчер скачает официальный установщик и откроет его. Путь по умолчанию - <code class="path">C:\Program Files\Eclipse Adoptium\</code>; именно оттуда Java подбирается в первую очередь.</div>
             <div class="java-found" id="java-found"></div>
           </div>
           <div class="field"><label class="field-label">Выделенная память</label>
@@ -765,11 +910,10 @@
         </div>
         <div class="settings-card" id="custom-card">
           <h3>Кастомизация</h3>
-          <div id="cz-main">${customizationCardHtml()}</div>
-          <div class="cz-divider"></div>
-          <div id="bg-card">${bgCardHtml()}</div>
-          <div class="cz-divider"></div>
-          <div id="rail-card">${railCardHtml()}</div>
+          ${czSectionHtml('basic', 'Основное', 'Шрифт, фон «Продолжить играть», стиль стекла', `<div id="cz-basic">${czBasicHtml()}</div>`)}
+          ${czSectionHtml('theme', 'Тема', 'Готовые и свои цветовые темы', `<div id="cz-main">${customizationCardHtml()}</div>`)}
+          ${czSectionHtml('bg', 'Настройка фона', 'Фото или 3D-модель на фоне лаунчера, размытие', `<div id="bg-blur-box">${bgBlurHtml()}</div><div id="bg-card">${bgCardHtml()}</div>`)}
+          ${czSectionHtml('rail', 'Панель быстрого доступа', 'Значки левой панели и их порядок', `<div id="rail-card">${railCardHtml()}</div>`)}
         </div>
 
         <div class="settings-card">
@@ -781,7 +925,7 @@
             ${uiPrefToggle('noAnimations', 'Отключить плавные анимации', 'Мгновенные переходы без анимаций', s)}
             ${uiPrefToggle('trafficSaver', 'Экономия трафика', 'Без иконок Modrinth и автообновления новостей', s)}
             ${uiPrefToggle('noBackground', 'Отключить фон', 'Скрыть анимированный и пользовательский фон', s)}
-          </div>
+            ${uiPrefToggle('noSeasonal', 'Отключить сезонные эффекты', 'Снег зимой, сердечки на 14 февраля и другие праздничные эффекты', s)}          </div>
         </div>
 
         <div class="settings-card">
@@ -813,13 +957,17 @@
           </div>
         </div>
 
+        <div class="settings-card" id="crash-card">${crashCardHtml()}</div>
+
         <div class="settings-card">
           <h3>Фикс версий</h3>
-          <div class="field-hint" style="margin:0 0 14px">Добавляет к папкам сборок префикс с версией Minecraft, например <b>[1.20.1]</b> fabric-loader-0.16.10-1.20.1 — иначе версия загрузчика может определиться как версия игры. В лаунчере префикс не показывается. Чистые vanilla-папки (1.20.1) не трогаются.</div>
+          <div class="field-hint" style="margin:0 0 14px">Добавляет к папкам сборок префикс с версией Minecraft, например <b>[1.20.1]</b> fabric-loader-0.16.10-1.20.1 - иначе версия загрузчика может определиться как версия игры. В лаунчере префикс не показывается. Чистые vanilla-папки (1.20.1) не трогаются.</div>
           <div class="field-row settings-data-actions">
             <button class="btn-secondary" id="set-fix-versions">${I.restart} Исправить имена версий</button>
           </div>
         </div>
+
+        ${s.debugMode ? `<div class="settings-card" id="debug-card">${debugCardHtml()}</div>` : ''}
 
         <div class="thanks-card">
           ${I.heart}
@@ -831,6 +979,115 @@
       </div>`;
     }
   };
+
+  function debugCardHtml() {
+    const s = D.settings || {};
+    const SE = window.MglSeasonal;
+    if (!SE) return '<h3>Дебаг</h3><div class="field-hint">Модуль сезонных эффектов не загружен</div>';
+    const date = SE.parseDate(s.seasonDate) || new Date();
+    const auto = SE.detect(date);
+    const cur = s.seasonOverride || '';
+    const fmt = (md) => { const [m, d] = md.split('-'); return `${+d}.${m}`; };
+    const opts = [['', `Авто по дате${auto ? ' (' + auto.name + ')' : ' (нет события)'}`], ['off', 'Выключить всё']]
+      .concat(SE.EVENTS.map(e => [e.id, e.name]))
+      .map(([v, l]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${escapeHtml(l)}</option>`).join('');
+    const rows = SE.EVENTS.map(e => `<div class="season-row ${auto && auto.id === e.id ? 'on' : ''}">
+        <span class="season-name">${escapeHtml(e.name)}</span>
+        <span class="season-dates">${fmt(e.from)} - ${fmt(e.to)}</span>
+        <span class="season-desc">${escapeHtml(e.desc)}</span>
+        <button class="btn-ghost season-try" data-season-try="${e.id}">Показать</button></div>`).join('');
+    const dens = s.seasonDensity || 1;
+    return `<h3>Дебаг</h3>
+      <div class="field-hint" style="margin:0 0 14px">Проверка сезонных эффектов. По умолчанию эффект выбирается по текущей дате; здесь можно включить любой принудительно или подставить другую дату.</div>
+      <div class="field"><label class="field-label">Сезонный эффект</label>
+        <select id="dbg-season" class="select">${opts}</select></div>
+      <div class="field"><label class="field-label">Симуляция даты</label>
+        <div class="field-row">
+          <input type="date" id="dbg-season-date" value="${escapeHtml(s.seasonDate || '')}">
+          <button type="button" class="btn-ghost" id="dbg-season-date-clear" title="Сегодняшняя дата">×</button>
+        </div></div>
+      <div class="field"><label class="field-label">Плотность частиц</label>
+        <div class="field-row">
+          <input type="range" id="dbg-season-density" min="0.2" max="3" step="0.1" value="${dens}">
+          <span class="range-val" id="dbg-season-density-val">×${(+dens).toFixed(1)}</span>
+        </div></div>
+      <div class="season-list">${rows}</div>
+      <div class="toggle-row" style="margin-top:14px"><div><div class="tl">Режим бога в мини-играх</div>
+        <div class="ts">Змейка, динозаврик, пинг-понг и «Уклонись в ритм» - проиграть нельзя. Рекорды и победы в этом режиме не сохраняются.</div></div>
+        <div class="switch ${s.gameGodMode ? 'on' : ''}" id="dbg-god-switch"></div></div>
+      <div class="field-row settings-data-actions" style="margin-top:12px">
+        <button class="btn-secondary" id="dbg-sans-voice" title="Звук печати текста из финала «Уклонись в ритм»">Голос из мини-игры</button>
+        <button class="btn-secondary" id="dbg-season-reset">${I.restart} Сбросить дебаг</button>
+      </div>`;
+  }
+  function bindDebugCard() {
+    const card = content.querySelector('#debug-card');
+    if (!card) return;
+    const update = (patch) => {
+      saveSettings(patch);
+      applySeasonal();
+      card.innerHTML = debugCardHtml();
+      bindDebugCard();
+    };
+    const sel = card.querySelector('#dbg-season');
+    if (sel) sel.addEventListener('change', () => update({ seasonOverride: sel.value }));
+    const date = card.querySelector('#dbg-season-date');
+    if (date) date.addEventListener('change', () => update({ seasonDate: date.value }));
+    const clr = card.querySelector('#dbg-season-date-clear');
+    if (clr) clr.addEventListener('click', () => update({ seasonDate: '' }));
+    const dens = card.querySelector('#dbg-season-density');
+    if (dens) {
+      dens.addEventListener('input', () => { card.querySelector('#dbg-season-density-val').textContent = '×' + (+dens.value).toFixed(1); });
+      dens.addEventListener('change', () => { saveSettings({ seasonDensity: +dens.value }); applySeasonal(); });
+    }
+    card.querySelectorAll('[data-season-try]').forEach(b => b.addEventListener('click', () => {
+      update({ seasonOverride: b.dataset.seasonTry });
+      MglSeasonal.replay();   // розыгрыш 1 апреля - показать заново, даже если уже выбран
+    }));
+    const god = card.querySelector('#dbg-god-switch');
+    if (god) god.addEventListener('click', async () => {
+      const on = !(D.settings || {}).gameGodMode;
+      if (on && !await confirmDialog({
+        title: 'Режим бога',
+        message: 'В мини-играх нельзя будет проиграть.\nРекорды и победы, набранные в этом режиме, не сохраняются.',
+        okText: 'Включить'
+      })) return;
+      update({ gameGodMode: on });
+      toast(on ? 'Режим бога включён - рекорды не сохраняются' : 'Режим бога выключен');
+    });
+    const voice = card.querySelector('#dbg-sans-voice');
+    if (voice) voice.addEventListener('click', () => {
+      const line = '* хе-хе. неплохой лаунчер, приятель.';
+      HeroScenes.sansSay(line);
+      toast(line);
+    });
+    const reset = card.querySelector('#dbg-season-reset');
+    if (reset) reset.addEventListener('click', () => update({ seasonOverride: '', seasonDate: '', seasonDensity: 1, gameGodMode: false }));
+  }
+
+  // Скрытая карточка «Дебаг»: 5 быстрых кликов по «Magma Launcher» в шапке. При скрытии дебаг-настройки сбрасываются,
+  // чтобы принудительный эффект не остался висеть без возможности его выключить.
+  (function initDebugTap() {
+    const brand = document.getElementById('breadcrumb-brand');
+    if (!brand) return;
+    let clicks = 0, timer = 0;
+    brand.addEventListener('click', () => {
+      clicks++;
+      clearTimeout(timer);
+      timer = setTimeout(() => { clicks = 0; }, 600);
+      if (clicks < 5) return;
+      clicks = 0;
+      const on = !(D.settings || {}).debugMode;
+      saveSettings(on ? { debugMode: true } : { debugMode: false, seasonOverride: '', seasonDate: '', seasonDensity: 1, gameGodMode: false });
+      applySeasonal();
+      toast(on ? 'Режим отладки включён - карточка «Дебаг» в настройках' : 'Режим отладки выключен');
+      if (currentView === 'settings') {
+        setView('settings');
+        const card = on && content.querySelector('#debug-card');
+        if (card) card.scrollIntoView({ block: 'center', behavior: uiPrefs().noAnimations ? 'auto' : 'smooth' });
+      }
+    });
+  })();
 
   function statsCard() {
     const s = D.settings || {};
@@ -969,7 +1226,7 @@
         if (btn.isConnected) btn.disabled = false;
         if (!r || !r.ok) {
           Downloads.finish('mc:' + mc, { ok: false, error: (r && r.error) || 'ошибка' });
-          toast('Не удалось установить: ' + (r && r.error || ''));
+          toast(r && r.cancelled ? 'Установка отменена' : 'Не удалось установить: ' + (r && r.error || ''));
           return;
         }
         Downloads.finish('mc:' + mc, { ok: true });
@@ -1035,7 +1292,7 @@
           ipc.removeListener('java:installProgress', onJava);
           if (!r || !r.ok) {
             Downloads.finish(taskId, { ok: false, error: (r && r.error) || 'ошибка' });
-            toast('Не удалось установить: ' + (r && r.error || ''));
+            toast(r && r.cancelled ? `Установка ${name} отменена` : 'Не удалось установить: ' + (r && r.error || ''));
             return;
           }
           Downloads.finish(taskId, { ok: true });
@@ -1162,7 +1419,7 @@
     const list = [].concat((D.settings && D.settings.serverHistory) || [], D.customServers || [], D.servers || [])
       .filter(s => s && s.ip && !seen.has(normIp(s.ip)) && seen.add(normIp(s.ip)))
       .slice(0, 5);
-    pop.innerHTML = `<div class="srv-pop-title">Недавние серверы · клик — быстрый вход</div>` + (list.length
+    pop.innerHTML = `<div class="srv-pop-title">Недавние серверы · клик - быстрый вход</div>` + (list.length
       ? list.map(s => `
         <div class="srv-pop-row" data-ip="${escapeHtml(s.ip)}" data-name="${escapeHtml(s.name || s.ip)}">
           <img src="${artFor((s.name || '') + (s.ip || ''))}" alt="" data-ping-icon>
@@ -1197,11 +1454,32 @@
     const btn = hero.querySelector('#hero-servers-btn'), pop = hero.querySelector('#srv-pop');
     if (pop) pop.classList.add('hidden');
     if (btn) { btn.innerHTML = on ? HERO_ICON_CLOSE : HERO_ICON_ARROW; btn.title = on ? 'Закрыть игру' : 'Недавние серверы'; }
-    if (on) HeroScenes.startGame(); else HeroScenes.stopGame();
+    if (on) {
+      // у градиента/визуализатора своего канваса сцен нет - создаём временный под игру
+      const kind = heroGameKind(hero);
+      if (!hero.querySelector('.hero-scene')) {
+        const cv = document.createElement('canvas');
+        cv.className = 'hero-scene hero-game-cv'; cv.dataset.scene = kind;
+        hero.querySelector('.hero-noise').before(cv);
+        HeroScenes.attach(cv, kind);
+      }
+      HeroScenes.startGame(kind);
+    } else {
+      HeroScenes.stopGame();
+      const cv = hero.querySelector('.hero-game-cv');
+      if (cv) cv.remove();
+    }
+  }
+  // фон hero → его мини-игра
+  const HERO_GAMES = { snake: 'snake', land: 'dino', dots: 'paint', luni: 'lunigame', viz: 'dodge', anim: 'pong' };
+  function heroGameKind(hero) {
+    const sc = hero.querySelector('.hero-scene');
+    return HERO_GAMES[sc ? sc.dataset.scene : hero.classList.contains('viz-mode') ? 'viz' : 'anim'];
   }
   function initHeroGame() {
     const hero = content.querySelector('.hero');
-    if (!hero || !hero.querySelector('.hero-scene[data-scene="snake"]')) return;
+    if (!hero) return;
+    HeroScenes.onExit = () => { const h = content.querySelector('.hero.game'); if (h) setHeroGame(h, false); };
     let clicks = [];
     hero.addEventListener('click', (e) => {
       if (e.target.closest('button, .srv-pop') || hero.classList.contains('game')) return;
@@ -1211,8 +1489,33 @@
     });
   }
 
-  let skinViewer = null, currentSkinUrl = null, currentCapeUrl = null;
+  let skinViewer = null, currentSkinUrl = null, currentCapeUrl = null, currentSkinFile = null;
   function disposeViewer() { if (skinViewer) { try { skinViewer.dispose(); } catch (e) {} skinViewer = null; } }
+  const SKIN_MODEL_NAME = { classic: 'Classic (Steve)', slim: 'Slim (Alex)' };
+  function currentSkinModel() { return currentSkinFile && window.SkinStore ? SkinStore.getModel(currentSkinFile) : 'auto'; }
+  function syncSkinModelUi(detected) {
+    const tabs = document.getElementById('skin-model-tabs'), hint = document.getElementById('skin-model-hint');
+    if (!tabs) return;
+    const m = currentSkinModel();
+    tabs.querySelectorAll('[data-skin-model]').forEach(b => b.classList.toggle('active', b.dataset.skinModel === m));
+    tabs.classList.toggle('disabled', !currentSkinFile);
+    if (!hint) return;
+    if (!currentSkinFile) { hint.textContent = ''; return; }
+    if (m !== 'auto') { hint.textContent = 'В игре: ' + SKIN_MODEL_NAME[m]; return; }
+    const d = detected || SkinStore.effectiveModel(currentSkinFile);
+    hint.textContent = 'Определено автоматически: ' + (SKIN_MODEL_NAME[d] || SKIN_MODEL_NAME.classic);
+  }
+  function bindSkinModelTabs() {
+    const tabs = document.getElementById('skin-model-tabs');
+    if (!tabs) return;
+    tabs.querySelectorAll('[data-skin-model]').forEach(b => b.addEventListener('click', () => {
+      if (!currentSkinFile) return;
+      SkinStore.setModel(currentSkinFile, b.dataset.skinModel);
+      const card = document.querySelector(`#skin-grid .skin-card[data-skin="${CSS.escape(currentSkinFile)}"]`);
+      if (card) card.classList.toggle('slim', b.dataset.skinModel === 'slim');
+      renderModel();
+    }));
+  }
 
   function renderModel() {
     const canvas = document.getElementById('skin-canvas');
@@ -1222,14 +1525,25 @@
       stage.innerHTML = `<img src="${currentSkinUrl}" style="width:96px;image-rendering:pixelated">`; return;
     }
     const w = stage.clientWidth || 180, h = stage.clientHeight || 240;
+    const m = currentSkinModel(), file = currentSkinFile;
+    const model = m === 'slim' ? 'slim' : m === 'classic' ? 'default' : 'auto-detect';
     try {
       if (!skinViewer) {
-        skinViewer = new skinview3d.SkinViewer({ canvas, width: w, height: h, skin: currentSkinUrl });
+        skinViewer = new skinview3d.SkinViewer({ canvas, width: w, height: h });
         skinViewer.animation = new skinview3d.WalkingAnimation();
         skinViewer.animation.speed = 0.6; skinViewer.zoom = 0.85;
         skinViewer.controls.enableZoom = true;
         if (skinViewer.camera) skinViewer.camera.position.z = 55;
-      } else { skinViewer.setSize(w, h); skinViewer.loadSkin(currentSkinUrl); }
+      } else skinViewer.setSize(w, h);
+      const viewer = skinViewer;
+      Promise.resolve(viewer.loadSkin(currentSkinUrl, { model })).then(() => {
+        if (viewer !== skinViewer || file !== currentSkinFile) return;
+        let det = null;
+        try { det = viewer.playerObject.skin.modelType === 'slim' ? 'slim' : 'classic'; } catch (e) {}
+        // авто-определение запоминаем - по нему main выбирает модель для MGL S&C при запуске
+        if (det && m === 'auto' && file && window.SkinStore) SkinStore.setDetected(file, det);
+        syncSkinModelUi(m === 'auto' ? det : null);
+      }).catch(() => syncSkinModelUi());
       if (currentCapeUrl) {
         const p = skinViewer.loadCape(currentCapeUrl);
         if (p && p.catch) p.catch(err => {
@@ -1253,15 +1567,15 @@
       <div class="skin-card add-skin" id="skin-add-card">${I.plus}<div class="skin-card-name" style="margin-top:8px">Добавить</div></div>`;
     const active = skins.find(s => s.active) || skins[0];
     const nameEl = document.getElementById('skin-active-name');
-    if (active) { if (nameEl) nameEl.textContent = active.name; currentSkinUrl = active.url; renderModel(); }
-    else if (nameEl) nameEl.textContent = 'Нет скинов';
+    if (active) { if (nameEl) nameEl.textContent = active.name; currentSkinUrl = active.url; currentSkinFile = active.file; renderModel(); }
+    else { currentSkinFile = null; if (nameEl) nameEl.textContent = 'Нет скинов'; syncSkinModelUi(); }
     updateAvatars();
     grid.querySelectorAll('.skin-card[data-skin]').forEach(card =>
       card.addEventListener('click', () => {
         grid.querySelectorAll('.skin-card').forEach(c => c.classList.remove('active'));
         card.classList.add('active');
         document.getElementById('skin-active-name').textContent = card.querySelector('.skin-card-name').textContent;
-        currentSkinUrl = card.dataset.url; renderModel();
+        currentSkinUrl = card.dataset.url; currentSkinFile = card.dataset.skin; renderModel();
       }));
     const addCard = grid.querySelector('#skin-add-card');
     addCard.addEventListener('click', (e) => {
@@ -1349,8 +1663,8 @@
   function skinCardHtml(s, kind) {
     const pin = s.pinned ? `<span class="skin-card-pin" title="Закреплено"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2 7h7l-5.5 4.5L17 21l-5-3-5 3 1.5-7.5L3 9h7z"/></svg></span>` : '';
     return `
-      <div class="skin-card ${s.active ? 'active' : ''}" data-${kind}="${escapeHtml(s.file)}" data-url="${escapeHtml(s.url)}">
-        ${pin}<button class="skin-card-more" data-more title="Ещё">${I.dots}</button>
+      <div class="skin-card ${s.active ? 'active' : ''} ${kind === 'skin' && s.model === 'slim' ? 'slim' : ''}" data-${kind}="${escapeHtml(s.file)}" data-url="${escapeHtml(s.url)}">
+        ${pin}<button class="skin-card-more" data-more title="Ещё">${I.dots}</button>${kind === 'skin' ? '<span class="skin-card-slim" title="Модель Slim (Alex)">Slim</span>' : ''}
         <img src="${escapeHtml(s.url)}" alt=""><div class="skin-card-name">${escapeHtml(s.name)}</div></div>`;
   }
   function bindSkinCardMenus(grid, kind) {
@@ -1459,6 +1773,7 @@
     const hint = document.getElementById('skin-folder-hint');
     if (hint) hint.textContent = SkinStore.isReal ? 'Папка: ' + SkinStore.folder() : SkinStore.folder();
     await SkinStore.ensureDefaultSkin();
+    bindSkinModelTabs();
     refreshSkinGrid();
     refreshCapeGrid();
 
@@ -1571,7 +1886,7 @@
     const srv = (D.managedServers || []).find(s => s.id === d.id);
     const name = srv ? srv.name : d.id;
     if (d.state === 'running' && prev !== 'running') {
-      toast(`Сервер «${name}» запущен — порт ${rt.port || 25565}`);
+      toast(`Сервер «${name}» запущен - порт ${rt.port || 25565}`);
       setTimeout(() => pingManagedPlayers(d.id), 1500);
     }
     if (d.state === 'stopped' && d.crashed) {
@@ -1754,7 +2069,7 @@
       if (!h) return;
       h.textContent = res.ok
         ? `Сервер онлайн: ${res.online}/${res.max} игроков · версия ${res.version || '?'} · ${res.latency} мс`
-        : 'Сервер не ответил на пинг — подключение всё равно будет выполнено после запуска';
+        : 'Сервер не ответил на пинг - подключение всё равно будет выполнено после запуска';
     });
   }
   const PROP_DEFS = [
@@ -1782,7 +2097,7 @@
     ['level-name', 'Папка мира', 'text', 'world'],
     ['level-seed', 'Сид мира', 'text', ''],
     ['level-type', 'Тип мира', 'text', 'minecraft:normal'],
-    ['server-ip', 'IP привязки (пусто — все интерфейсы)', 'text', '']
+    ['server-ip', 'IP привязки (пусто - все интерфейсы)', 'text', '']
   ];
   const PROP_HINT = { gamemode: { survival: 'Выживание', creative: 'Творческий', adventure: 'Приключение', spectator: 'Наблюдатель' },
     difficulty: { peaceful: 'Мирная', easy: 'Лёгкая', normal: 'Нормальная', hard: 'Сложная' } };
@@ -1828,10 +2143,10 @@
         <div class="field"><label class="field-label">Доп. JVM-аргументы</label><input type="text" id="mc-jvm" value="${escapeHtml(srv.jvmArgs || '')}" placeholder="-XX:+UseG1GC" spellcheck="false"></div>
         <div class="prop-section prop-section-row"><span>server.properties</span>
           <input type="text" id="prop-search" class="prop-search" placeholder="Поиск параметра…" spellcheck="false"></div>
-        ${res.exists && otherKeys.length ? '' : '<div class="field-hint prop-note">Полный список параметров появится после первого запуска сервера — сейчас показаны основные со значениями по умолчанию.</div>'}
+        ${res.exists && otherKeys.length ? '' : '<div class="field-hint prop-note">Полный список параметров появится после первого запуска сервера - сейчас показаны основные со значениями по умолчанию.</div>'}
         <div class="prop-list" id="prop-list">${knownRows}
           ${otherRows ? `<div class="prop-section prop-sub">Остальные параметры</div>${otherRows}` : ''}</div>
-        ${running ? '<div class="field-hint prop-note warn">Сервер запущен — изменения применятся после перезапуска.</div>' : ''}`,
+        ${running ? '<div class="field-hint prop-note warn">Сервер запущен - изменения применятся после перезапуска.</div>' : ''}`,
       okText: 'Сохранить',
       onOk: async (m) => {
         if (!ipc) { toast('Доступно в приложении'); return false; }
@@ -1860,7 +2175,7 @@
           if ('server-ip' in changed) rt.serverIp = changed['server-ip'];
         }
         setView('servers');
-        toast(running && Object.keys(changed).length ? 'Сохранено — перезапустите сервер, чтобы применить' : 'Параметры сохранены');
+        toast(running && Object.keys(changed).length ? 'Сохранено - перезапустите сервер, чтобы применить' : 'Параметры сохранены');
         return true;
       }
     });
@@ -2097,6 +2412,20 @@
     });
   }
   async function confirmDialog(opts) { return (await appConfirm(opts)) === true; }
+  // Подтверждение удаления файла контента; для модов предупреждает, если от него зависят другие установленные моды
+  async function confirmRemoveContent({ projectType, instance, filename, where }) {
+    const ipc = getIpc();
+    let extra = '';
+    if (ipc && (projectType || 'mod') === 'mod') {
+      const d = await ipc.invoke('modrinth:dependents', { projectType: 'mod', instance, filename }).catch(() => null);
+      const list = (d && d.dependents) || [];
+      if (list.length) extra = `\n\n⚠ От этого мода зависят: ${list.slice(0, 6).map(x => x.title).join(', ')}${list.length > 6 ? ` и ещё ${list.length - 6}` : ''}. Без него они могут не запуститься.`;
+    }
+    return confirmDialog({
+      title: extra ? 'Удалить мод, от которого зависят другие?' : 'Удалить файл',
+      message: `Удалить файл ${filename}${where ? ' ' + where : ''}?` + extra, okText: 'Удалить', danger: true
+    });
+  }
 
   function openServerStorage(id) {
     const ipc = getIpc();
@@ -2208,7 +2537,7 @@
         title: 'Смена папки игры',
         message: `Новый путь:\n${picked}\n\nТекущая папка:\n${cur.current}\n\n` +
           `Перенести всё содержимое (сборки, моды, скины, сервера) в новую папку? Старая папка будет удалена.\n` +
-          `Или просто переключиться — старое останется на месте.`,
+          `Или просто переключиться - старое останется на месте.`,
         okText: 'Перенести', cancelText: 'Только переключиться'
       });
       if (migrate === null) return;
@@ -2226,6 +2555,7 @@
       saveSettings({ minecraftDir: r.path });
       if (mcdirInput) mcdirInput.value = r.path;
       // перечитаем установленные версии из новой папки
+      if (window.MglIcons) MglIcons.reload();
       D.instances = await ipc.invoke('mc:getInstalled');
       D.servers = await ipc.invoke('mc:getServers');
       D.customServers = await ipc.invoke('srv:listCustom');
@@ -2242,6 +2572,7 @@
       if (r && r.ok) {
         saveSettings({ minecraftDir: null });
         if (mcdirInput) mcdirInput.value = '';
+        if (window.MglIcons) MglIcons.reload();
         D.instances = await ipc.invoke('mc:getInstalled');
         D.servers = await ipc.invoke('mc:getServers');
         normalize();
@@ -2297,8 +2628,8 @@
     const seen = seenNewsSet();
     list.innerHTML = items.map(n => `
       <div class="news-card ${seen.has(newsKey(n)) ? '' : 'unread'}">
-        <div class="news-card-title">${escapeHtml(n.title)}${seen.has(newsKey(n)) ? '' : '<span class="news-new">новое</span>'}</div>
-        <div class="news-card-desc">${escapeHtml(n.desc)}</div>
+        <div class="news-card-title"><span translate="no">${escapeHtml(newsText(n, 'title'))}</span>${seen.has(newsKey(n)) ? '' : '<span class="news-new">новое</span>'}</div>
+        <div class="news-card-desc" translate="no">${escapeHtml(newsText(n, 'desc'))}</div>
         ${n.url ? `<a class="news-card-link" href="#" data-news-url="${escapeHtml(n.url)}">Открыть ссылку</a>` : ''}
       </div>`).join('');
     list.querySelectorAll('[data-news-url]').forEach(el =>
@@ -2421,7 +2752,7 @@
     const all = _myContentItems;
     if (!all.length) {
       if (statusEl) statusEl.textContent = '';
-      listEl.innerHTML = `<div class="empty">${I.box}<div>Ничего не установлено</div><div class="empty-sub">Перейдите в «Браузер контента», чтобы скачать моды, текстуры или шейдеры</div></div>`;
+      listEl.innerHTML = `<div class="empty">${I.box}<div>Ничего не установлено</div><div class="empty-sub">Перейдите в «Браузер контента», чтобы скачать моды, текстуры или шейдеры</div>${emptyBtns([['browse', `${I.dl} Открыть браузер контента`, true]])}</div>`;
       return;
     }
     const isOff = (it) => /\.disabled$/i.test(it.filename);
@@ -2442,7 +2773,7 @@
     const row = (it) => {
       const off = isOff(it);
       const displayName = it.filename.replace(/\.disabled$/i, '');
-      const date = new Date(it.added || it.mtime).toLocaleDateString('ru-RU');
+      const date = new Date(it.added || it.mtime).toLocaleDateString(MGL_LOCALE);
       const mgl = isMgl(it);
       return `
         <div class="mycontent-row ${off ? 'disabled' : ''} ${mgl ? 'mgl-skin' : ''}">
@@ -2455,7 +2786,7 @@
               ? `<span class="mc-state ${off ? 'off' : 'on'}" title="Включается автоматически при запуске подходящей сборки">${off ? 'ожидает' : 'активен'}</span>`
               : `<div class="switch ${off ? '' : 'on'}" data-mc-toggle="${escapeHtml(it.filename)}" title="${off ? 'Включить' : 'Отключить'}"></div>`}
             ${mgl
-              ? `<span class="mc-lock" title="Управляется лаунчером. Чтобы убрать — отключите «Использовать MGL S&amp;C» в настройках">${I.lock}</span>`
+              ? `<span class="mc-lock" title="Управляется лаунчером. Чтобы убрать - отключите «Использовать MGL S&amp;C» в настройках">${I.lock}</span>`
               : `<button class="btn-ghost danger" data-mc-remove="${escapeHtml(it.filename)}" title="Удалить">×</button>`}
           </div>
         </div>`;
@@ -2481,8 +2812,9 @@
       btn.addEventListener('click', async () => {
         const ipc = getIpc();
         if (!ipc) return;
-        if (!await confirmDialog({ title: 'Удалить файл', message: 'Удалить файл ' + btn.dataset.mcRemove + '?', okText: 'Удалить', danger: true })) return;
         btn.disabled = true;
+        const okRemove = await confirmRemoveContent({ projectType: _myContentType, filename: btn.dataset.mcRemove });
+        if (!okRemove) { btn.disabled = false; return; }
         const res = await ipc.invoke('modrinth:remove', { projectType: _myContentType, filename: btn.dataset.mcRemove });
         if (res && res.ok) { toast('Удалено'); await loadMyContent(); }
         else { toast('Ошибка: ' + (res && res.error || '')); btn.disabled = false; }
@@ -2497,8 +2829,21 @@
       noNeon: all || !!s.noNeon,
       noAnimations: all || !!s.noAnimations,
       trafficSaver: all || !!s.trafficSaver,
-      noBackground: all || !!s.noBackground
+      noBackground: all || !!s.noBackground,
+      noSeasonal: all || !!s.noSeasonal
     };
+  }
+  function applySeasonal() {
+    if (!window.MglSeasonal) return;
+    const s = D.settings || {}, p = uiPrefs();
+    // «Отключить сезонные эффекты», «без анимаций» и режим оптимизации гасят всё, включая эффект из дебага
+    // (поздравление в ДР остаётся).
+    MglSeasonal.apply({
+      effects: !p.noSeasonal && !p.noAnimations,
+      override: s.seasonOverride || '',
+      date: s.seasonDate || '',
+      density: s.seasonDensity || 1
+    });
   }
   function uiPrefToggle(key, title, sub, s) {
     return `<div class="toggle-row"><div><div class="tl">${title}</div>${sub ? `<div class="ts">${sub}</div>` : ''}</div>
@@ -2510,7 +2855,9 @@
     document.body.classList.toggle('no-anim', p.noAnimations);
     document.body.classList.toggle('no-bg', p.noBackground);
     document.body.classList.toggle('font-mc', (D.settings || {}).uiFont === 'minecraft');
+    applyLookPrefs();
     applyBackground();
+    applySeasonal();
     cacheSplashPref();
   }
 
@@ -2601,6 +2948,7 @@
     news: { title: 'Новости', view: 'news', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h5M8 16h8"/></svg>' },
     mycontent: { title: 'Мой контент', view: 'mycontent', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 7l-8-4-8 4m16 0v10l-8 4m8-14l-8 4m-8-4v10l8 4m-8-14l8 4m0 0v10"/></svg>' },
     browse: { title: 'Браузер контента', view: 'browse', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18"/></svg>' },
+    packs: { title: 'Сборки', view: 'packs', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l8 4.5-8 4.5-8-4.5z"/><path d="M4 12l8 4.5 8-4.5"/><path d="M4 16.5l8 4.5 8-4.5"/></svg>' },
     library: { title: 'Библиотека', view: 'library', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2z"/><path d="M8 7h8"/></svg>' },
     servers: { title: 'Серверы', view: 'servers', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>' },
     sessions: { title: 'Активные сессии', view: 'sessions', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M10 8l6 4-6 4z"/></svg>' },
@@ -2609,7 +2957,9 @@
     plugins: { title: 'Плагины', view: 'plugins', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3v4M15 3v4M7 7h10v4a5 5 0 0 1-10 0zM12 16v5"/></svg>' },
     settings: { title: 'Настройки', view: 'settings', locked: true, svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1-1.6 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 112.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.6-1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.6 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.6 1z"/></svg>' }
   };
-  const RAIL_DEFAULT = ['home', 'news', 'mycontent', 'browse', 'library', 'servers', '-sessions', 'skins', 'spacer', 'folder', 'settings'];
+  const RAIL_DEFAULT = ['home', 'news', 'mycontent', 'browse', 'library', 'packs', 'servers', '-sessions', 'skins', 'spacer', 'folder', 'settings'];
+  // новые значки, которые у старых раскладок должны появиться видимыми: id → после какого встать
+  const RAIL_NEW_VISIBLE = { packs: 'library' };
   function railLayout() {
     const saved = D.settings && Array.isArray(D.settings.railLayout) ? D.settings.railLayout : null;
     let list = saved
@@ -2617,7 +2967,13 @@
       : RAIL_DEFAULT.map(id => ({ id: id.replace(/^-/, ''), hidden: id[0] === '-' }));
     const seen = new Set();
     list = list.filter(x => x.id === 'spacer' || (!seen.has(x.id) && seen.add(x.id)));
-    Object.keys(RAIL_DEFS).forEach(id => { if (!seen.has(id)) list.push({ id, hidden: id !== 'settings' }); });
+    Object.keys(RAIL_DEFS).forEach(id => {
+      if (seen.has(id)) return;
+      if (id in RAIL_NEW_VISIBLE) {
+        const at = list.findIndex(x => x.id === RAIL_NEW_VISIBLE[id]);
+        list.splice(at >= 0 ? at + 1 : list.length, 0, { id, hidden: false });
+      } else list.push({ id, hidden: id !== 'settings' });
+    });
     return list;
   }
   function renderRail() {
@@ -2663,7 +3019,6 @@
         </div>`;
     }).join('');
     return `
-      <div class="cz-block-title">Панель быстрого доступа</div>
       <div class="field-hint" style="margin:0 0 12px">Какие значки показывать в левой панели и в каком порядке. Перетаскивайте строки мышью или используйте стрелки.</div>
       <div class="rail-cfg-list" id="rail-cfg-list">${rows}</div>
       <div class="field-row" style="margin-top:12px">
@@ -2728,7 +3083,8 @@
   }
 
   const BG_FRAME_W = 1170, BG_FRAME_H = 722;
-  const _bgLists = { pictures: null, obj: null };
+  const _bgLists = { pictures: null, obj: null, videos: null };
+  const BG_KIND = { photo: 'pictures', video: 'videos', '3d': 'obj' }, BG_ID = { photo: 'photoId', video: 'videoId', '3d': 'objId' };
   let _bgLiveScene = null, _bgLivePhoto = null, _bgApplyToken = 0;
   let _bgEditorMode = null, _bgEd = null;
 
@@ -2752,11 +3108,11 @@
     return null;
   }
   function coverScale(img, W, H) {
-    const iw = img.naturalWidth || 1, ih = img.naturalHeight || 1;
+    const iw = img.naturalWidth || img.videoWidth || 1, ih = img.naturalHeight || img.videoHeight || 1;
     return Math.max(1, (H / W) * (iw / ih));
   }
   function layoutPhoto(img, W, H, t) {
-    const iw = img.naturalWidth || 1, ih = img.naturalHeight || 1;
+    const iw = img.naturalWidth || img.videoWidth || 1, ih = img.naturalHeight || img.videoHeight || 1;
     const w = t.scale * W, h = w * ih / iw;
     img.style.width = w + 'px';
     img.style.height = h + 'px';
@@ -2780,7 +3136,21 @@
     const s = bgSettings();
     const token = ++_bgApplyToken;
     if (uiPrefs().noBackground || !s.mode) { clearLiveBackground(); return; }
-    if (s.mode === 'photo') {
+    if (s.mode === 'video') {
+      const e = (await bgList('videos')).find(x => x.id === s.videoId);
+      if (token !== _bgApplyToken) return;
+      clearLiveBackground();
+      if (!e || !e.url) return;
+      layer.innerHTML = '<video class="app-bg-img" muted loop playsinline></video><div class="app-bg-dim"></div>';
+      const v = layer.querySelector('video');
+      v.muted = true; v.loop = true;
+      const t = { x: e.x || 0, y: e.y || 0, scale: e.scale != null ? e.scale : null };
+      _bgLivePhoto = { img: v, t };
+      v.onloadedmetadata = () => { if (t.scale == null) t.scale = coverScale(v, window.innerWidth, window.innerHeight); layoutLivePhoto(); };
+      v.src = e.url;
+      if (!uiPrefs().noAnimations) v.play().catch(() => {});
+      window.addEventListener('resize', layoutLivePhoto);
+    } else if (s.mode === 'photo') {
       const e = (await bgList('pictures')).find(x => x.id === s.photoId);
       if (token !== _bgApplyToken) return;
       clearLiveBackground();
@@ -2820,23 +3190,23 @@
   function bgCardHtml() {
     const s = bgSettings();
     const mode = _bgEditorMode || s.mode || 'photo';
-    const cur = s.mode === 'photo' ? 'Фото' : s.mode === '3d' ? '3D-модель' : 'нет';
+    const cur = s.mode === 'photo' ? 'Фото' : s.mode === 'video' ? 'Видео' : s.mode === '3d' ? '3D-модель' : 'нет';
     return `
-      <div class="cz-block-title">Настройка фона</div>
       <div class="account-tabs bg-mode-tabs">
         <button class="account-tab ${mode === '3d' ? 'active' : ''}" data-bg-mode="3d">3D</button>
         <button class="account-tab ${mode === 'photo' ? 'active' : ''}" data-bg-mode="photo">Фото</button>
+        <button class="account-tab ${mode === 'video' ? 'active' : ''}" data-bg-mode="video">Видео</button>
       </div>
       <div class="bg-current">Сейчас на фоне: <b>${cur}</b>${s.mode ? ' · <a href="#" id="bg-clear">убрать фон</a>' : ''}${uiPrefs().noBackground ? ' · <span class="mc-off">фон отключён в «Оптимизация»</span>' : ''}</div>
       <div class="bgp-toolbar">
-        <button class="btn-secondary" id="bg-pick">${mode === 'photo' ? 'Выбрать фото' : 'Загрузить модель (.obj / .zip)'}</button>
-        <span class="bgp-hint">${mode === 'photo' ? 'ЛКМ - двигать · колесо - масштаб' : 'ЛКМ - двигать · колесо - масштаб · ПКМ - вращать'}</span>
+        <button class="btn-secondary" id="bg-pick">${mode === 'photo' ? 'Выбрать фото' : mode === 'video' ? 'Выбрать видео' : 'Загрузить модель (.obj / .zip)'}</button>
+        <span class="bgp-hint">${mode !== '3d' ? 'ЛКМ - двигать · колесо - масштаб' : 'ЛКМ - двигать · колесо - масштаб · ПКМ - вращать'}</span>
       </div>
       <div class="bgp-frame" id="bgp-frame">
         <div class="bgp-layer" id="bgp-layer"></div>
         <div class="bgp-dim"></div>
         ${mockLauncherHtml()}
-        <div class="bgp-empty hidden" id="bgp-empty">Выберите ${mode === 'photo' ? 'фото' : 'модель'} или элемент из истории</div>
+        <div class="bgp-empty hidden" id="bgp-empty">Выберите ${mode === 'photo' ? 'фото' : mode === 'video' ? 'видео' : 'модель'} или элемент из истории</div>
       </div>
       ${mode === '3d' ? `
       <div class="bgp-spin">
@@ -2849,9 +3219,9 @@
         <button class="btn-secondary" id="bg-cancel">Отменить</button>
         <button class="btn primary sm" id="bg-save">Сохранить</button>
       </div>
-      <div class="bgp-history-title">История <span>.minecraft/mgl/data/${mode === 'photo' ? 'pictures' : 'obj'}</span></div>
+      <div class="bgp-history-title">История <span>.minecraft/mgl/data/${BG_KIND[mode]}</span></div>
       <div class="bgp-history" id="bgp-history"></div>
-      <input type="file" id="bg-file" hidden accept="${mode === 'photo' ? 'image/*' : '.obj,.zip'}">`;
+      <input type="file" id="bg-file" hidden accept="${mode === 'photo' ? 'image/*' : mode === 'video' ? 'video/*,.mp4,.webm,.mov,.m4v,.mkv,.ogv,.ogg,.avi' : '.obj,.zip'}">`;
   }
   function disposeBgEditor() {
     if (!_bgEd) return;
@@ -2867,7 +3237,7 @@
     initBgCard();
   }
   function bgPickTransform(e, mode) {
-    if (mode === 'photo') return { x: e.x || 0, y: e.y || 0, scale: e.scale != null ? e.scale : null };
+    if (mode !== '3d') return { x: e.x || 0, y: e.y || 0, scale: e.scale != null ? e.scale : null };
     return {
       x: e.x || 0, y: e.y || 0, scale: e.scale || 0.6,
       rx: e.rx || 0, ry: e.ry || 0, rz: e.rz || 0,
@@ -2877,9 +3247,9 @@
   function bgEdUpdateView() {
     const ed = _bgEd;
     if (!ed || !ed.t) return;
-    if (ed.mode === 'photo') {
+    if (ed.mode !== '3d') {
       const f = content.querySelector('#bgp-frame');
-      if (!ed.img || !f || !ed.img.naturalWidth) return;
+      if (!ed.img || !f || !(ed.img.naturalWidth || ed.img.videoWidth)) return;
       if (ed.t.scale == null) ed.t.scale = coverScale(ed.img, BG_FRAME_W, BG_FRAME_H);
       layoutPhoto(ed.img, f.clientWidth, f.clientHeight, ed.t);
     } else if (ed.scene) ed.scene.setTransform(ed.t);
@@ -2900,7 +3270,14 @@
     ed.t = bgPickTransform(entry, ed.mode);
     const empty = content.querySelector('#bgp-empty');
     if (empty) empty.classList.add('hidden');
-    if (ed.mode === 'photo') {
+    if (ed.mode === 'video') {
+      layer.innerHTML = '<video class="bgp-img" muted loop playsinline></video>';
+      ed.img = layer.querySelector('video');
+      ed.img.muted = true;
+      ed.img.onloadedmetadata = bgEdUpdateView;
+      ed.img.src = entry.url;
+      ed.img.play().catch(() => {});
+    } else if (ed.mode === 'photo') {
       layer.innerHTML = '<img class="bgp-img" alt="" draggable="false">';
       ed.img = layer.querySelector('img');
       ed.img.onload = bgEdUpdateView;
@@ -2935,11 +3312,13 @@
     if (!ed || !el) return;
     const list = _bgLists[ed.kind] || [];
     const s = bgSettings();
-    const activeId = s.mode === ed.mode ? (ed.mode === 'photo' ? s.photoId : s.objId) : null;
+    const activeId = s.mode === ed.mode ? s[BG_ID[ed.mode]] : null;
     if (!list.length) { el.innerHTML = '<div class="bgp-history-empty">Пока пусто - сохранённые варианты появятся здесь</div>'; return; }
     el.innerHTML = list.map(e => `
       <div class="bgp-hist ${ed.entry && ed.entry.id === e.id ? 'sel' : ''}" data-bg-hist="${escapeHtml(e.id)}" title="${escapeHtml(e.name || '')}">
-        ${ed.mode === 'photo'
+        ${ed.mode === 'video'
+          ? `<video src="${escapeHtml(e.url || '')}#t=0.5" muted preload="metadata" draggable="false"></video>`
+          : ed.mode === 'photo'
           ? `<img src="${escapeHtml(e.url || '')}" alt="" draggable="false">`
           : `<div class="bgp-hist-obj">${I.box}<span>${escapeHtml(e.name || 'Модель')}</span></div>`}
         ${e.id === activeId ? '<span class="bgp-hist-badge">на фоне</span>' : ''}
@@ -2978,7 +3357,8 @@
   async function bgEdFilePicked(file) {
     const ed = _bgEd;
     if (!ed || !file) return;
-    if (ed.mode === 'photo') {
+    if (ed.mode !== '3d') {
+      if (ed.mode === 'video' && !/\.(mp4|webm|mov|m4v|mkv|ogv|ogg|avi)$/i.test(file.name) && !/^video\//.test(file.type)) { toast('Это не видеофайл'); return; }
       if (ed.objectUrl) URL.revokeObjectURL(ed.objectUrl);
       ed.objectUrl = URL.createObjectURL(file);
       bgEdLoad({ id: null, _temp: true, _srcPath: file.path || null, url: ed.objectUrl, name: file.name, x: 0, y: 0, scale: null });
@@ -3002,7 +3382,7 @@
   }
   async function bgEdSave() {
     const ed = _bgEd;
-    if (!ed || !ed.entry || !ed.t) { toast('Сначала выберите ' + (ed && ed.mode === 'photo' ? 'фото' : 'модель')); return; }
+    if (!ed || !ed.entry || !ed.t) { toast('Сначала выберите ' + (ed && ed.mode === 'photo' ? 'фото' : ed && ed.mode === 'video' ? 'видео' : 'модель')); return; }
     const entry = {};
     Object.keys(ed.entry).forEach(k => { if (k[0] !== '_' && k !== 'url' && k !== 'texUrl') entry[k] = ed.entry[k]; });
     Object.assign(entry, JSON.parse(JSON.stringify(ed.t)));
@@ -3016,13 +3396,13 @@
       await bgList(ed.kind, true);
     } else {
       saved = { ...ed.entry, ...entry, id: ed.entry.id || ('mem' + Date.now()), _temp: false };
-      if (ed.mode === 'photo') ed.objectUrl = null; // URL теперь живёт в истории
+      if (ed.mode !== '3d') ed.objectUrl = null; // URL теперь живёт в истории
       const list = await bgList(ed.kind);
       const i = list.findIndex(x => x.id === saved.id);
       if (i >= 0) list.splice(i, 1);
       list.unshift(saved);
     }
-    saveSettings({ bg: { ...bgSettings(), mode: ed.mode, [ed.mode === 'photo' ? 'photoId' : 'objId']: saved.id } });
+    saveSettings({ bg: { ...bgSettings(), mode: ed.mode, [BG_ID[ed.mode]]: saved.id } });
     _bgEditorMode = ed.mode;
     toast('Фон сохранён');
     await applyBackground();
@@ -3051,7 +3431,7 @@
     if (!card) return;
     disposeBgEditor();
     const mode = _bgEditorMode || bgSettings().mode || 'photo';
-    const ed = _bgEd = { mode, kind: mode === 'photo' ? 'pictures' : 'obj', entry: null, t: null, scene: null, img: null, objectUrl: null };
+    const ed = _bgEd = { mode, kind: BG_KIND[mode], entry: null, t: null, scene: null, img: null, objectUrl: null };
     bgFrameGlobalHandlers();
 
     card.querySelectorAll('[data-bg-mode]').forEach(b => b.addEventListener('click', () => {
@@ -3075,7 +3455,7 @@
       if (ed.entry._temp) {
         const s = bgSettings();
         const list = _bgLists[ed.kind] || [];
-        const back = list.find(x => x.id === (mode === 'photo' ? s.photoId : s.objId)) || list[0];
+        const back = list.find(x => x.id === s[BG_ID[mode]]) || list[0];
         if (back) bgEdLoad(back); else bgEdShowEmpty();
       } else bgEdLoad(ed.entry);
       toast('Изменения отменены');
@@ -3119,7 +3499,7 @@
     const list = await bgList(ed.kind);
     if (_bgEd !== ed) return;
     const s = bgSettings();
-    const start = list.find(x => x.id === (mode === 'photo' ? s.photoId : s.objId)) || list[0];
+    const start = list.find(x => x.id === s[BG_ID[mode]]) || list[0];
     if (start) bgEdLoad(start); else { bgEdShowEmpty(); renderBgHistory(); }
   }
 
@@ -3136,7 +3516,7 @@
     if (s.cpuMHz) parts.push(`${(s.cpuMHz / 1000).toFixed(2)} ГГц`);
     parts.push(`ОЗУ ${(s.totalMb / 1024).toFixed(1)} ГБ`);
     return `<div class="hw-info ${s.weak ? 'weak' : ''}"><div>${parts.join(' · ')}</div>
-      ${s.weak ? `<div class="hw-weak">Слабый ПК: ${escapeHtml(s.reasons.join(', '))} — режим оптимизации включён автоматически</div>` : ''}</div>`;
+      ${s.weak ? `<div class="hw-weak">Слабый ПК: ${escapeHtml(s.reasons.join(', '))} - режим оптимизации включён автоматически</div>` : ''}</div>`;
   }
   async function loadSysInfo() {
     const ipc = getIpc();
@@ -3156,7 +3536,7 @@
     if ((st.memoryMax || 2048) > s.maxGameMb) saveSettings({ memoryMax: s.recommendedMb });
     if (s.weak && !st.autoOptApplied) {
       saveSettings({ optimization: true, autoOptApplied: true });
-      setTimeout(() => toast('Слабый ПК (' + s.reasons.join(', ') + ') — включён режим оптимизации'), 800);
+      setTimeout(() => toast('Слабый ПК (' + s.reasons.join(', ') + ') - включён режим оптимизации'), 800);
     }
   }
 
@@ -3190,21 +3570,13 @@
         ${custom ? `<span class="theme-actions"><span data-theme-edit="${id}" title="Изменить">${I.pencil}</span><span data-theme-del="${id}" title="Удалить">×</span></span>` : ''}
       </div>`;
   }
-  const HERO_MODES = [['anim', 'Градиент'], ['viz', 'Визуализатор звука'], ['snake', 'Змейки'], ['land', 'Пиксельный пейзаж'], ['dots', 'Точечный шрифт']];
+  const HERO_MODES = [['anim', 'Градиент'], ['viz', 'Визуализатор звука'], ['snake', 'Змейки'], ['land', 'Пиксельный пейзаж'], ['dots', 'Точечный шрифт'], ['luni', 'Луни']];
   function customizationCardHtml() {
     const s = D.settings || {};
     if (!window.MglThemes) return '';
     const presets = MglThemes.PRESETS;
     const customs = s.customThemes || [];
     return `
-      <div class="toggle-row"><div><div class="tl">Шрифт</div><div class="ts">Пиксельный шрифт Minecraft или стандартный Inter</div></div>
-        <div class="account-tabs font-tabs">
-          <button class="account-tab ${s.uiFont === 'minecraft' ? 'active' : ''}" data-ui-font="minecraft">Minecraft</button>
-          <button class="account-tab ${s.uiFont === 'minecraft' ? '' : 'active'}" data-ui-font="default">По умолчанию</button>
-        </div></div>
-      <div class="toggle-row"><div><div class="tl">Фон блока «Продолжить играть»</div><div class="ts">Анимация на главной. Визуализатор во время игры реагирует на системный звук (включая Minecraft)</div></div>
-        <div class="hero-mode-pick"><select id="hero-mode">${HERO_MODES.map(([v, n]) => `<option value="${v}" ${(s.heroMode || 'anim') === v ? 'selected' : ''}>${n}</option>`).join('')}</select></div></div>
-      <div class="cz-sub">Тема</div>
       <div class="theme-cols">
         <div><div class="theme-col-title">Тёмные</div><div class="theme-grid">${presets.filter(t => t.mode !== 'light').map(t => themeCardHtml(t)).join('')}</div></div>
         <div><div class="theme-col-title">Светлые</div><div class="theme-grid">${presets.filter(t => t.mode === 'light').map(t => themeCardHtml(t)).join('')}</div></div>
@@ -3216,6 +3588,92 @@
       </div>
       <div class="theme-editor hidden" id="theme-editor"></div>`;
   }
+  // ---- Кастомизация: сворачиваемые подвкладки ----
+  const CZ_KEY = 'mgl.czCollapsed';
+  function czCollapsed() { try { return new Set(JSON.parse(localStorage.getItem(CZ_KEY) || '[]')); } catch (e) { return new Set(); } }
+  function czSectionHtml(id, title, sub, body) {
+    const closed = czCollapsed().has(id);
+    return `
+      <div class="cz-section ${closed ? 'closed' : ''}" data-cz="${id}">
+        <div class="cz-head" role="button" tabindex="0" aria-expanded="${!closed}">
+          <div><div class="cz-head-title">${title}</div><div class="cz-head-sub">${sub}</div></div>
+          <span class="cz-chev"></span>
+        </div>
+        <div class="cz-body">${body}</div>
+      </div>`;
+  }
+  function bindCzSections() {
+    content.querySelectorAll('.cz-section > .cz-head').forEach(h => {
+      const toggle = (e) => {
+        if (e.type === 'keydown' && e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        const sec = h.parentElement, closed = !sec.classList.contains('closed');
+        sec.classList.toggle('closed', closed);
+        h.setAttribute('aria-expanded', String(!closed));
+        const set = czCollapsed();
+        closed ? set.add(sec.dataset.cz) : set.delete(sec.dataset.cz);
+        try { localStorage.setItem(CZ_KEY, JSON.stringify(Array.from(set))); } catch (err) {}
+        // превью фона меряет размеры рамки - после разворачивания пересчитать
+        if (!closed && sec.dataset.cz === 'bg') requestAnimationFrame(() => { bgEdUpdateView(); window.dispatchEvent(new Event('resize')); });
+      };
+      h.addEventListener('click', toggle);
+      h.addEventListener('keydown', toggle);
+    });
+  }
+  const GLASS_MODES = [['off', 'Выключено'], ['liquid', 'Жидкое стекло'], ['frosted', 'Матовое стекло']];
+  function czBasicHtml() {
+    const s = D.settings || {};
+    const glass = GLASS_MODES.some(([v]) => v === s.glass) ? s.glass : 'off';
+    return `
+      <div class="toggle-row"><div><div class="tl">Шрифт</div><div class="ts">Пиксельный шрифт Minecraft или стандартный Inter</div></div>
+        <div class="account-tabs font-tabs">
+          <button class="account-tab ${s.uiFont === 'minecraft' ? 'active' : ''}" data-ui-font="minecraft">Minecraft</button>
+          <button class="account-tab ${s.uiFont === 'minecraft' ? '' : 'active'}" data-ui-font="default">По умолчанию</button>
+        </div></div>
+      <div class="toggle-row"><div><div class="tl">Фон блока «Продолжить играть»</div><div class="ts">Анимация на главной. Визуализатор во время игры реагирует на системный звук (включая Minecraft)</div></div>
+        <div class="hero-mode-pick"><select id="hero-mode">${HERO_MODES.map(([v, n]) => `<option value="${v}" ${(s.heroMode || 'anim') === v ? 'selected' : ''}>${n}</option>`).join('')}</select></div></div>
+      <div class="toggle-row"><div><div class="tl">Стекло</div><div class="ts">Кнопки и блоки в стиле жидкого или матового стекла - лучше всего смотрится с фоном. В режиме оптимизации отключается</div></div>
+        <div class="hero-mode-pick"><select id="glass-mode">${GLASS_MODES.map(([v, n]) => `<option value="${v}" ${glass === v ? 'selected' : ''}>${n}</option>`).join('')}</select></div></div>`;
+  }
+  function bgBlurAmount() { const v = +((D.settings || {}).bgBlurAmount); return v >= 1 && v <= 40 ? v : 8; }
+  function bgBlurHtml() {
+    const s = D.settings || {};
+    return `
+      <div class="toggle-row"><div><div class="tl">Размытие фона</div><div class="ts">Размывает фото или 3D-модель на фоне лаунчера</div></div>
+        <div class="switch ${s.bgBlur ? 'on' : ''}" id="bg-blur-switch"></div></div>
+      <div class="bg-blur-range ${s.bgBlur ? '' : 'disabled'}">
+        <span class="bgp-spin-label">Сила</span>
+        <input type="range" id="bg-blur-amount" min="1" max="40" step="1" value="${bgBlurAmount()}">
+        <span class="range-val" id="bg-blur-val">${bgBlurAmount()} px</span>
+      </div>`;
+  }
+  function bindBgBlur() {
+    const sw = content.querySelector('#bg-blur-switch'), range = content.querySelector('#bg-blur-amount');
+    if (!sw || !range) return;
+    sw.addEventListener('click', () => {
+      const on = !sw.classList.contains('on');
+      sw.classList.toggle('on', on);
+      content.querySelector('.bg-blur-range').classList.toggle('disabled', !on);
+      saveSettings({ bgBlur: on });
+      applyLookPrefs();
+    });
+    range.addEventListener('input', () => {
+      content.querySelector('#bg-blur-val').textContent = range.value + ' px';
+      D.settings = { ...(D.settings || {}), bgBlurAmount: +range.value };
+      applyLookPrefs();
+    });
+    range.addEventListener('change', () => saveSettings({ bgBlurAmount: +range.value }));
+  }
+  // Размытие фона + стекло: классы на body, сила - CSS-переменная
+  function applyLookPrefs() {
+    const s = D.settings || {}, p = uiPrefs();
+    document.body.classList.toggle('bg-blur', !!s.bgBlur);
+    document.body.style.setProperty('--bg-blur', bgBlurAmount() + 'px');
+    const glass = p.optimization ? 'off' : s.glass;
+    document.body.classList.toggle('glass-liquid', glass === 'liquid');
+    document.body.classList.toggle('glass-frosted', glass === 'frosted');
+  }
+
   let _themeDraft = null, _themePickers = null;
   function renderCustomCard() {
     const card = content.querySelector('#cz-main');
@@ -3256,7 +3714,7 @@
         <div><div class="te-label">Фон</div><div class="te-picker" id="te-bg"></div></div>
         <div><div class="te-label">Акцентный цвет</div><div class="te-picker" id="te-accent"></div></div>
       </div>
-      <div class="field-hint te-hint">Выбирайте цвет на палитре или из быстрых цветов — изменения сразу видны во всём лаунчере. Остальные оттенки подбираются автоматически.</div>
+      <div class="field-hint te-hint">Выбирайте цвет на палитре или из быстрых цветов - изменения сразу видны во всём лаунчере. Остальные оттенки подбираются автоматически.</div>
       <div class="te-actions">
         <button class="btn-secondary" data-te-cancel>Отмена</button>
         <button class="btn primary sm" data-te-save>${theme ? 'Сохранить' : 'Создать тему'}</button>
@@ -3339,13 +3797,26 @@
     if (!card) return;
     card.onclick = onCustomCardClick;
     card.onkeydown = onCustomCardClick;
-    card.onchange = (e) => {
-      if (e.target.id !== 'hero-mode') return;
-      const mode = e.target.value;
-      saveSettings({ heroMode: mode });
-      if (mode === 'viz' && !getIpc()) toast('Захват звука доступен в приложении — в превью показана демо-анимация');
-      HeroViz.sync();
-    };
+    const basic = content.querySelector('#cz-basic');
+    if (basic) {
+      basic.onclick = onCustomCardClick;
+      basic.onkeydown = onCustomCardClick;
+      basic.onchange = (e) => {
+        if (e.target.id === 'glass-mode') {
+          saveSettings({ glass: e.target.value });
+          applyLookPrefs();
+          if (e.target.value !== 'off' && uiPrefs().optimization) toast('Стекло не применяется в режиме оптимизации');
+          return;
+        }
+        if (e.target.id !== 'hero-mode') return;
+        const mode = e.target.value;
+        saveSettings({ heroMode: mode });
+        if (mode === 'viz' && !getIpc()) toast('Захват звука доступен в приложении - в превью показана демо-анимация');
+        HeroViz.sync();
+      };
+    }
+    bindCzSections();
+    bindBgBlur();
   }
 
   function reapplyAllSettings() {
@@ -3406,7 +3877,7 @@
         D.instances = await ipc.invoke('mc:getInstalled');
         normalize(); renderInstances();
         const n = Object.keys(map).length, sk = (r.skipped || []).length;
-        toast(n ? `Переименовано сборок: ${n}` + (sk ? `, пропущено: ${sk}` : '') : (sk ? 'Не удалось: ' + r.skipped.map(x => verLabel(x.folder) + ' — ' + x.error).join('; ') : 'Все версии уже в порядке'));
+        toast(n ? `Переименовано сборок: ${n}` + (sk ? `, пропущено: ${sk}` : '') : (sk ? 'Не удалось: ' + r.skipped.map(x => verLabel(x.folder) + ' - ' + x.error).join('; ') : 'Все версии уже в порядке'));
       } finally { fix.disabled = false; }
     });
   }
@@ -3439,7 +3910,7 @@
     let active = SkinStore.getActive();
     if (!active && SkinStore.ensureDefaultSkin) { await SkinStore.ensureDefaultSkin(); active = SkinStore.getActive(); }
     let face;
-    try { face = await renderSkinFace(active ? skinUrlToSrc(active.url) : 'assets/player.png'); } catch (e) { return; }
+    try { face = await renderSkinFace(active ? skinUrlToSrc(active.url) : 'assets/images/player.png'); } catch (e) { return; }
     document.querySelectorAll('.rail-session img, .profile-card img, .account-avatar img').forEach(img => {
       img.src = face;
       img.classList.add('skin-face');
@@ -3459,7 +3930,6 @@
       const p = uiPrefs();
       return ((D.settings || {}).heroMode === 'viz') && !p.optimization && !p.noAnimations;
     };
-    const gameRunning = () => (D.sessions || []).length > 0;
 
     async function connect() {
       const ipc = getIpc();
@@ -3500,8 +3970,9 @@
       stream = null; actx = null; analyser = null; bins = null;
     }
     api.sync = function () {
-      if (!(api.wanted() && gameRunning())) { disconnect(); failed = false; return; }
-      if (canvas) connect();
+      // захват системного звука идёт, пока визуализатор виден на главной (любая игра/музыка/видео), а не только при запущенном Minecraft
+      if (!(api.wanted() && canvas && canvas.isConnected)) { disconnect(); failed = false; return; }
+      connect();
     };
 
     function resize() {
@@ -3522,7 +3993,7 @@
     }
     function frame(now) {
       raf = requestAnimationFrame(frame);
-      if (!canvas || !canvas.isConnected) { stop(); return; }
+      if (!canvas || !canvas.isConnected) { stop(); disconnect(); return; }
       if (document.hidden) return;
       if (!resize()) return;
       if (++colorAge > 90) { colorAge = 0; readAccent(); }
@@ -3597,10 +4068,12 @@
   })();
 
   const HeroScenes = (function () {
-    const MODES = ['snake', 'land', 'dots'];
+    const MODES = ['snake', 'land', 'dots', 'luni'];
     let canvas = null, ctx = null, raf = 0, ro = null, scene = null;
     let W = 0, H = 0, last = 0, acc = 0, colorAge = 0;
-    let C = { acc: '#4fa66b', acc2: '#8fd6a5', accDim: '#2f6a44', warm: '#d7793d', warm2: '#e3a04f', text: '#e8ece9', bg: '#0b0d0c' };
+    let C = { acc: '#4fa66b', acc2: '#8fd6a5', accDim: '#2f6a44', warm: '#d7793d', warm2: '#e3a04f', hot: '#ec5a6e', text: '#e8ece9', bg: '#0b0d0c' };
+    let prevScene = null;
+    const held = new Set();
     const api = {};
 
     api.mode = function () {
@@ -3613,7 +4086,7 @@
     const irand = n => Math.floor(Math.random() * n);
     const pick = arr => arr[irand(arr.length)];
     const wrap = (v, n) => (v + n) % n;
-    // внизу слева — текст hero, там рисуем тише
+    // внизу слева - текст hero, там рисуем тише
     const side = (x, y) => {
       if (scene && scene.flat) return 1;
       const fx = Math.min(1, Math.max(0, (x - W * 0.28) / (W * 0.32)));
@@ -3628,6 +4101,56 @@
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fill();
     }
+    // спрайт из строк '0101…' → точки; x, y - левый верхний угол, s - шаг сетки
+    const spr = rows => {
+      const p = [];
+      rows.forEach((r, y) => [...r].forEach((b, x) => { if (b === '1') p.push(x, y); }));
+      return { p, w: rows[0].length, h: rows.length };
+    };
+    function sprite(sp, x, y, s, color, alpha = 1) {
+      const r = s * 0.42;
+      ctx.globalAlpha = alpha; ctx.fillStyle = color; ctx.beginPath();
+      for (let i = 0; i < sp.p.length; i += 2) {
+        const cx = x + (sp.p[i] + 0.5) * s, cy = y + (sp.p[i + 1] + 0.5) * s;
+        ctx.moveTo(cx + r, cy); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      }
+      ctx.fill();
+    }
+    // фоновая сетка точек - рисуется один раз во offscreen-канвас
+    let gridCache = null;
+    function drawGrid(gap, r, color, alpha, ox = gap / 2, oy = gap / 2) {
+      const key = [W, H, gap, r, color, alpha, ox, oy].join();
+      if (!gridCache || gridCache.key !== key) {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2), cv = document.createElement('canvas');
+        cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+        const g = cv.getContext('2d');
+        g.scale(dpr, dpr); g.fillStyle = color; g.globalAlpha = alpha; g.beginPath();
+        for (let x = ox; x < W; x += gap) for (let y = oy; y < H; y += gap) { g.moveTo(x + r, y); g.arc(x, y, r, 0, Math.PI * 2); }
+        g.fill();
+        gridCache = { key, cv };
+      }
+      ctx.globalAlpha = 1;
+      ctx.drawImage(gridCache.cv, 0, 0, W, H);
+    }
+    function overlay(title, sub, y = H / 2) {
+      ctx.globalAlpha = 1; ctx.fillStyle = C.text; ctx.textAlign = 'center';
+      ctx.font = '700 22px sans-serif'; ctx.fillText(title, W / 2, y - 4);
+      ctx.globalAlpha = 0.7; ctx.font = '13px sans-serif'; ctx.fillText(sub, W / 2, y + 20);
+      ctx.textAlign = 'start';
+    }
+    // счёт/подсказка в углу hero (.hero-score)
+    // Дебаг → «Режим бога»: проиграть нельзя, рекорды/победы не пишутся
+    const god = () => { const s = D.settings || {}; return !!(s.debugMode && s.gameGodMode); };
+    function hud(items, hint) {
+      const hero = canvas && canvas.closest('.hero'), el = hero && hero.querySelector('.hero-score');
+      if (!el) return;
+      if (god() && scene !== Paint) hint = 'режим бога · рекорд не сохраняется' + (hint ? ' · ' + hint : '');
+      const html = items.map(([l, v]) => `<span>${l} <b>${v}</b></span>`).join('') + (hint ? `<span class="hs-hint">${hint}</span>` : '');
+      if (el.innerHTML !== html) el.innerHTML = html;
+    }
+    const loadNum = k => { try { return +localStorage.getItem(k) || 0; } catch (e) { return 0; } };
+    const saveNum = (k, v) => { try { localStorage.setItem(k, String(v)); } catch (e) {} };
+    const KEYMAP = { ArrowUp: [0, -1], KeyW: [0, -1], ArrowDown: [0, 1], KeyS: [0, 1], ArrowLeft: [-1, 0], KeyA: [-1, 0], ArrowRight: [1, 0], KeyD: [1, 0] };
     const hex = c => '#' + c.map(v => Math.round(Math.max(0, Math.min(255, v))).toString(16).padStart(2, '0')).join('');
     const mix = (a, b, k) => a.map((v, i) => v + (b[i] - v) * k);
     function parseRgb(str) {
@@ -3642,7 +4165,7 @@
       const warm = [215, 121, 61];
       C = {
         acc: hex(a), acc2: hex(mix(a, [255, 255, 255], 0.3)), accDim: hex(mix(a, bg, 0.45)), accTeal: hex(mix(a, [52, 160, 163], 0.45)),
-        warm: hex(warm), warm2: hex(mix(warm, [255, 220, 120], 0.35)), text: hex(tx), bg: hex(bg)
+        warm: hex(warm), warm2: hex(mix(warm, [255, 220, 120], 0.35)), hot: hex(mix(warm, [255, 60, 140], 0.6)), text: hex(tx), bg: hex(bg)
       };
       if (scene && scene.recolor) scene.recolor();
     }
@@ -3666,17 +4189,14 @@
       },
       best: (() => { try { return +localStorage.getItem('mgl.snakeBest') || 0; } catch (e) { return 0; } })(),
       aiA: 1, aiTarget: 1, live: false, playing: false, ready: false, flat: false,
-      pushScore() {
-        const a = document.getElementById('hs-score'), b = document.getElementById('hs-best');
-        if (a) a.textContent = this.score || 0;
-        if (b) b.textContent = this.best;
-      },
+      pushScore() { hud([['Рекорд', this.best], ['Счёт', this.score || 0]]); },
+      onKey(e) { const d = KEYMAP[e.code]; if (!d) return false; this.turn(d); return true; },
       newRound() {
         const cx = Math.floor(this.cols / 2), cy = Math.floor(this.rows / 2);
         this.snakes = [{ player: true, body: [0, 1, 2, 3].map(i => ({ x: cx - i, y: cy })), grow: 0, dead: 0, dir: [1, 0], color: this.colors[0] }];
         this.apples = []; this.pops = [];
         for (let i = 0; i < 3; i++) this.apples.push(this.freeCell());
-        this.score = 0; this.q = []; this.over = false; this.waiting = true; this.ready = true; this.every = 105;
+        this.score = 0; this.q = []; this.over = false; this.waiting = true; this.ready = true; this.every = 105; this.cheat = false;
         this.pushScore();
       },
       turn(d) {
@@ -3702,10 +4222,11 @@
         this.pops = this.pops.filter(q => ++q.t < 5);
         const h = p.body[0], last = p.body.length - 1;
         const nx = wrap(h.x + p.dir[0], this.cols), ny = wrap(h.y + p.dir[1], this.rows);
-        const hit = p.body.some((b, i) => b.x === nx && b.y === ny && !(i === last && p.grow === 0));
+        if (god()) this.cheat = true;
+        const hit = !god() && p.body.some((b, i) => b.x === nx && b.y === ny && !(i === last && p.grow === 0));
         if (hit) {
           this.over = true;
-          if (this.score > this.best) { this.best = this.score; try { localStorage.setItem('mgl.snakeBest', String(this.best)); } catch (e) {} }
+          if (this.score > this.best && !this.cheat) { this.best = this.score; try { localStorage.setItem('mgl.snakeBest', String(this.best)); } catch (e) {} }
           this.pushScore();
           return;
         }
@@ -3719,12 +4240,7 @@
         }
         if (p.grow > 0) p.grow--; else p.body.pop();
       },
-      overlay(title, sub) {
-        ctx.globalAlpha = 1; ctx.fillStyle = C.text; ctx.textAlign = 'center';
-        ctx.font = '700 22px sans-serif'; ctx.fillText(title, W / 2, H / 2 - 4);
-        ctx.globalAlpha = 0.7; ctx.font = '13px sans-serif'; ctx.fillText(sub, W / 2, H / 2 + 20);
-        ctx.textAlign = 'start';
-      },
+      overlay(title, sub) { overlay(title, sub); },
       key(x, y) { return y * this.cols + x; },
       occupied() {
         const set = new Set();
@@ -3814,8 +4330,8 @@
           dot(cx(h.x) + s.dir[0] * c * 0.14, cy(h.y) + s.dir[1] * c * 0.14, c * 0.09, C.bg, fade * side(cx(h.x), cy(h.y)));
         }
         if (this.playing && this.ready) {
-          if (this.over) this.overlay('Игра окончена', 'Счёт: ' + this.score + ' · стрелка или WASD — заново');
-          else if (this.waiting) this.overlay('Змейка', 'WASD или стрелки — начать');
+          if (this.over) this.overlay('Игра окончена', 'Счёт: ' + this.score + ' · стрелка или WASD - заново');
+          else if (this.waiting) this.overlay('Змейка', 'WASD или стрелки - начать');
         }
       }
     };
@@ -3951,7 +4467,1199 @@
       }
     };
 
-    const SCENES = { snake: Snakes, land: Landscape, dots: DotFont };
+    // ---------- Мини-игры (5 быстрых кликов по hero) ----------
+    // Общий контракт игры: reset() - раскладка под W×H + новый раунд, start()/end(), step() с шагом every,
+    // draw(), onKey(e) → true если клавиша съедена, onKeyUp(e), onPointer(type, x, y, e), onWheel(dy).
+    const gameBase = {
+      every: 1000 / 60, flat: true, live: false, playing: false, inited: false, cursor: '',
+      start() { this.playing = true; this.live = true; if (canvas) canvas.style.cursor = this.cursor; },
+      end() { this.playing = false; this.live = false; if (canvas) canvas.style.cursor = ''; }
+    };
+
+    // Хром-динозаврик в точках (фон «Пиксельный пейзаж»)
+    const DINO_BODY = [
+      '000000111110', '000001101111', '000001111111', '000001111111', '000001111000', '000001111110',
+      '100011110000', '110111111100', '111111110100', '011111110000', '001111100000'
+    ];
+    const DUCK_BODY = ['000000000011110', '100000111110111', '111111111111111', '011111111111100', '001111111100000'];
+    const DINO_SP = {
+      jump: spr(DINO_BODY.concat(['000101000000', '000110110000'])),
+      runA: spr(DINO_BODY.concat(['000101000000', '000110000000'])),
+      runB: spr(DINO_BODY.concat(['000101000000', '000000110000'])),
+      duckA: spr(DUCK_BODY.concat(['000101000000000', '000110000000000'])),
+      duckB: spr(DUCK_BODY.concat(['000101000000000', '000000110000000']))
+    };
+    const CACTUS = {
+      small: spr(['00100', '00101', '10101', '10101', '10111', '11100', '00100', '00100']),
+      big: spr(['0001000', '0011100', '0011101', '1011101', '1011101', '1011101', '1111111', '0011100', '0011100', '0011100', '0011100'])
+    };
+    const BIRD = [
+      spr(['0000100000', '0000110000', '0100111000', '1111111111', '0001111110', '0000000000', '0000000000']),
+      spr(['0000000000', '0100000000', '1111111111', '0001111110', '0000111000', '0000110000', '0000100000'])
+    ];
+    const hash = (n, m) => (Math.imul(n | 0, 2654435761) >>> 0) % m;
+    const Dino = Object.assign({}, gameBase, {
+      best: loadNum('mgl.dinoBest'),
+      reset() {
+        this.s = Math.max(4, Math.min(7, Math.round(H / 75)));
+        const s = this.s;
+        this.ground = Math.round(H * 0.8 / s) * s;
+        this.dx = Math.round(W * 0.12 / s) * s;
+        if (!this.inited || this.waiting) this.newRound();
+        this.inited = W > 0;
+      },
+      newRound() {
+        this.y = 0; this.vy = 0; this.duck = false; this.obs = []; this.dist = 0; this.speed = 50;
+        this.score = 0; this.next = 40; this.over = false; this.waiting = true; this.frame = 0; this.cheat = false;
+        this.clouds = Array.from({ length: W < 640 ? 2 : 4 }, () => ({ x: rand(0, W), y: rand(H * 0.08, H * 0.38), w: 3 + irand(5) }));
+        this.pushScore();
+      },
+      pushScore() { hud([['Рекорд', String(this.best).padStart(5, '0')], ['Счёт', String(Math.floor(this.score)).padStart(5, '0')]]); },
+      press() {
+        if (this.over) { this.newRound(); this.waiting = false; return; }
+        if (this.waiting) this.waiting = false;
+        if (this.y === 0 && !this.duck) this.vy = 100;
+      },
+      onKey(e) {
+        if (['Space', 'ArrowUp', 'KeyW'].includes(e.code)) { if (!e.repeat) this.press(); return true; }
+        return ['ArrowDown', 'KeyS'].includes(e.code);
+      },
+      onKeyUp(e) { if (['Space', 'ArrowUp', 'KeyW'].includes(e.code) && this.vy > 38) this.vy = 38; },
+      onPointer(type) { if (type === 'pointerdown') this.press(); },
+      spawn() {
+        const s = this.s;
+        if (this.score > 250 && Math.random() < 0.3) {
+          this.obs.push({ bird: true, sp: BIRD[0], x: W + 10, y: pick([1, 9, 17]) });
+        } else {
+          const big = this.score > 120 && Math.random() < 0.4, sp = big ? CACTUS.big : CACTUS.small;
+          const n = 1 + irand(big ? 2 : 3);
+          for (let k = 0; k < n; k++) this.obs.push({ sp, x: W + 10 + k * (sp.w + 1) * s, y: 0 });
+        }
+        this.next = this.speed * rand(0.7, 1.35) + 14;
+      },
+      box(o) {
+        const s = this.s, top = this.ground - (o.y + o.sp.h) * s;
+        return [o.x + s * 0.7, top + s * 0.7, (o.sp.w - 1.4) * s, (o.sp.h - 1.4) * s];
+      },
+      dinoBox() {
+        const s = this.s;
+        if (this.duck) return [this.dx + s, this.ground - 6 * s, 13 * s, 6 * s];
+        const top = this.ground - (this.y + 13) * s;
+        return [this.dx + 2 * s, top + s, 8 * s, 11.5 * s];
+      },
+      step() {
+        this.frame++;
+        if (this.waiting || this.over) return;
+        const dt = this.every / 1000, s = this.s, down = held.has('ArrowDown') || held.has('KeyS');
+        this.speed = Math.min(105, this.speed + dt * 1.1);
+        const v = this.speed * s * dt;
+        this.dist += v;
+        this.score += this.speed * dt * 0.18;
+        if (this.y > 0 || this.vy > 0) {
+          this.vy -= (down ? 560 : 240) * dt;
+          this.y += this.vy * dt;
+          if (this.y <= 0) { this.y = 0; this.vy = 0; }
+        }
+        this.duck = down && this.y === 0;
+        for (const o of this.obs) { o.x -= v * (o.bird ? 1.12 : 1); if (o.bird) o.sp = BIRD[(this.frame >> 3) & 1]; }
+        this.obs = this.obs.filter(o => o.x + o.sp.w * s > -20);
+        if ((this.next -= this.speed * dt) <= 0) this.spawn();
+        for (const c of this.clouds) {
+          c.x -= v * 0.15;
+          if (c.x + c.w * s * 2 < 0) { c.x = W + rand(0, 120); c.y = rand(H * 0.08, H * 0.38); }
+        }
+        const a = this.dinoBox();
+        if (god()) this.cheat = true;
+        else for (const o of this.obs) {
+          const b = this.box(o);
+          if (a[0] < b[0] + b[2] && a[0] + a[2] > b[0] && a[1] < b[1] + b[3] && a[1] + a[3] > b[1]) {
+            this.over = true;
+            const sc = Math.floor(this.score);
+            if (sc > this.best && !this.cheat) { this.best = sc; saveNum('mgl.dinoBest', sc); }
+            break;
+          }
+        }
+        this.pushScore();
+      },
+      draw() {
+        const s = this.s, g = s * 2;
+        drawGrid(g, 0.9, C.text, 0.09);
+        // солнце и дальние холмы - как в пейзаже
+        const sun = { x: W * 0.82, y: H * 0.24, r: Math.max(24, H * 0.12) };
+        ctx.globalAlpha = 0.85; ctx.fillStyle = C.warm2; ctx.beginPath();
+        for (let x = g / 2; x < W; x += g) for (let y = g / 2; y < H * 0.5; y += g)
+          if (Math.hypot(x - sun.x, y - sun.y) < sun.r) { ctx.moveTo(x + s * 0.6, y); ctx.arc(x, y, s * 0.6, 0, Math.PI * 2); }
+        ctx.fill();
+        const far = this.dist * 0.12, fo = far % g, fi = Math.floor(far / g);
+        ctx.globalAlpha = 0.5; ctx.fillStyle = C.accDim; ctx.beginPath();
+        for (let i = 0, x = g / 2 - fo; x < W + g; i++, x += g) {
+          const wi = i + fi, top = this.ground - H * (0.14 + 0.08 * Math.sin(wi * 0.09) + 0.05 * Math.sin(wi * 0.23 + 1));
+          for (let y = this.ground - g; y > top; y -= g) { ctx.moveTo(x + s * 0.55, y); ctx.arc(x, y, s * 0.55, 0, Math.PI * 2); }
+        }
+        ctx.fill();
+        for (const c of this.clouds)
+          for (let k = 0; k < c.w; k++) {
+            dot(c.x + k * g, c.y, s * 0.5, C.text, 0.32);
+            if (k && k < c.w - 1) dot(c.x + k * g, c.y - g, s * 0.45, C.text, 0.22);
+          }
+        // земля: линия + камешки, едут вместе с миром
+        const go = this.dist % s, gi = Math.floor(this.dist / s);
+        ctx.globalAlpha = 0.9; ctx.fillStyle = C.acc; ctx.beginPath();
+        for (let k = 0, x = s / 2 - go; x < W + s; k++, x += s) {
+          const y = this.ground + s * 0.5;
+          ctx.moveTo(x + s * 0.36, y); ctx.arc(x, y, s * 0.36, 0, Math.PI * 2);
+          const h = hash(gi + k, 13);
+          if (h === 0 || h === 5) { ctx.moveTo(x + s * 0.3, y + s * 2); ctx.arc(x, y + s * 2, s * 0.3, 0, Math.PI * 2); }
+          if (h === 3) { ctx.moveTo(x + s * 0.3, y + s * 3.5); ctx.arc(x, y + s * 3.5, s * 0.3, 0, Math.PI * 2); }
+        }
+        ctx.fill();
+        for (const o of this.obs) sprite(o.sp, o.x, this.ground - (o.y + o.sp.h) * s, s, o.bird ? C.warm : C.acc, 1);
+        const run = (this.frame >> 3) & 1;
+        const sp = this.duck ? (run ? DINO_SP.duckA : DINO_SP.duckB)
+          : (this.y > 0 || this.waiting || this.over) ? DINO_SP.jump : (run ? DINO_SP.runA : DINO_SP.runB);
+        sprite(sp, this.dx, this.ground - this.y * s - sp.h * s, s, C.acc2, this.over ? 0.5 : 1);
+        if (this.waiting) overlay('Динозаврик', 'Пробел / ↑ / клик - прыжок · ↓ - пригнуться', H * 0.42);
+        else if (this.over) overlay('Игра окончена', 'Счёт: ' + Math.floor(this.score) + ' · пробел - заново', H * 0.42);
+      }
+    });
+
+    // Пинг-понг (фон «Градиент»)
+    const Pong = Object.assign({}, gameBase, {
+      cursor: 'none', target: 7,
+      wins: loadNum('mgl.pongWins'),
+      reset() {
+        this.k = Math.max(0.75, Math.min(1.3, H / 420));
+        this.ph = 80 * this.k; this.pw = 10; this.pad = 26; this.r = 7 * this.k;
+        if (!this.inited || this.waiting) this.newMatch();
+        else { this.bx = Math.min(this.bx, W); this.by = Math.min(this.by, H); }
+        this.inited = W > 0;
+      },
+      newMatch() {
+        this.me = 0; this.ai = 0; this.py = this.ay = H / 2; this.mouse = null;
+        this.over = false; this.waiting = true; this.serveTo = -1; this.parts = []; this.trail = []; this.aiErr = 0; this.cheat = false;
+        this.resetBall();
+        this.pushScore();
+      },
+      resetBall() { this.bx = W / 2; this.by = H / 2; this.bvx = this.bvy = 0; this.serveT = 0.7; this.trail = []; },
+      speed0() { return Math.max(300, W * 0.42); },
+      pushScore() { hud([['Вы', this.me], ['ИИ', this.ai], ['Побед', this.wins]]); },
+      press() {
+        if (this.over) { this.newMatch(); this.waiting = false; return; }
+        this.waiting = false;
+      },
+      onKey(e) {
+        if (e.code === 'Space') { if (!e.repeat) this.press(); return true; }
+        if (['ArrowUp', 'KeyW', 'ArrowDown', 'KeyS'].includes(e.code)) { if (this.waiting) this.waiting = false; return true; }
+        return false;
+      },
+      onPointer(type, x, y) {
+        if (type === 'pointermove' || type === 'pointerdown') this.mouse = y;
+        if (type === 'pointerdown') this.press();
+      },
+      sparks(x, y, dir, color) {
+        for (let i = 0; i < 10; i++) {
+          const a = rand(-1.1, 1.1) + (dir < 0 ? Math.PI : 0), v = rand(80, 260);
+          this.parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: rand(0.25, 0.5), color });
+        }
+      },
+      point(meScored) {
+        if (meScored) this.me++; else this.ai++;
+        this.sparks(meScored ? W - 4 : 4, this.by, meScored ? -1 : 1, meScored ? C.acc2 : C.hot);
+        this.serveTo = meScored ? 1 : -1;
+        if (this.me >= this.target || this.ai >= this.target) {
+          this.over = true;
+          if (this.me > this.ai && !this.cheat) { this.wins++; saveNum('mgl.pongWins', this.wins); }
+        }
+        this.resetBall();
+        this.pushScore();
+      },
+      step() {
+        const dt = this.every / 1000, half = this.ph / 2, lim = y => Math.max(half + 6, Math.min(H - half - 6, y));
+        const up = held.has('ArrowUp') || held.has('KeyW'), dn = held.has('ArrowDown') || held.has('KeyS');
+        if (up || dn) { this.mouse = null; this.py += ((dn ? 1 : 0) - (up ? 1 : 0)) * 560 * this.k * dt; }
+        else if (this.mouse != null) this.py += (this.mouse - this.py) * Math.min(1, dt * 20);
+        this.py = lim(this.py);
+        this.parts = this.parts.filter(p => (p.life -= dt) > 0);
+        for (const p of this.parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.93; p.vy *= 0.93; }
+        // ИИ: следит за мячом, когда тот летит к нему, с ошибкой прицеливания
+        const coming = this.bvx > 0 && this.bx > W * 0.35;
+        const tgt = coming ? this.by + this.aiErr : H / 2;
+        const aiMax = (300 + this.me * 18) * this.k * dt;
+        this.ay = lim(this.ay + Math.max(-aiMax, Math.min(aiMax, tgt - this.ay)));
+        if (this.waiting || this.over) return;
+        if (god()) this.cheat = true;
+        if (this.serveT > 0) {
+          if ((this.serveT -= dt) <= 0) {
+            const a = rand(-0.45, 0.45), v = this.speed0();
+            this.bvx = Math.cos(a) * v * this.serveTo; this.bvy = Math.sin(a) * v;
+          }
+          return;
+        }
+        const r = this.r, xL = this.pad + this.pw, xR = W - this.pad - this.pw;
+        for (let k = 0; k < 2; k++) {
+          this.bx += this.bvx * dt / 2; this.by += this.bvy * dt / 2;
+          if (this.by < r) { this.by = r; this.bvy = Math.abs(this.bvy); }
+          if (this.by > H - r) { this.by = H - r; this.bvy = -Math.abs(this.bvy); }
+          const hit = (py, dir) => {
+            const off = Math.max(-1, Math.min(1, (this.by - py) / half)), a = off * 1.0;
+            const v = Math.min(this.speed0() * 2.3, Math.hypot(this.bvx, this.bvy) * 1.06);
+            this.bvx = Math.cos(a) * v * dir; this.bvy = Math.sin(a) * v;
+          };
+          // в режиме бога ракетка игрока отбивает всё (мяч не пролетает мимо)
+          if (this.bvx < 0 && this.bx - r <= xL && this.bx > this.pad - r && (god() || Math.abs(this.by - this.py) <= half + r)) {
+            this.bx = xL + r; hit(this.py, 1); this.sparks(this.bx, this.by, 1, C.acc2);
+            this.aiErr = rand(-1, 1) * half * (0.35 + Math.min(0.6, this.me * 0.04));
+          }
+          if (this.bvx > 0 && this.bx + r >= xR && this.bx < W - this.pad + r && Math.abs(this.by - this.ay) <= half + r) {
+            this.bx = xR - r; hit(this.ay, -1); this.sparks(this.bx, this.by, -1, C.warm2);
+          }
+        }
+        this.trail.push([this.bx, this.by]);
+        if (this.trail.length > 12) this.trail.shift();
+        if (this.bx < -30) this.point(false);
+        else if (this.bx > W + 30) this.point(true);
+      },
+      draw() {
+        for (let y = 12; y < H; y += 18) dot(W / 2, y, 2.2, C.text, 0.16);
+        ctx.globalAlpha = 0.13; ctx.fillStyle = C.text; ctx.font = `700 ${Math.round(64 * this.k)}px sans-serif`;
+        ctx.textAlign = 'right'; ctx.fillText(this.me, W / 2 - 34, 30 + 64 * this.k);
+        ctx.textAlign = 'left'; ctx.fillText(this.ai, W / 2 + 34, 30 + 64 * this.k);
+        ctx.textAlign = 'start';
+        const paddle = (x, y, color) => {
+          ctx.globalAlpha = 1; ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 18;
+          ctx.beginPath();
+          if (ctx.roundRect) ctx.roundRect(x, y - this.ph / 2, this.pw, this.ph, this.pw / 2); else ctx.rect(x, y - this.ph / 2, this.pw, this.ph);
+          ctx.fill(); ctx.shadowBlur = 0;
+        };
+        paddle(this.pad, this.py, C.acc2);
+        paddle(W - this.pad - this.pw, this.ay, C.warm);
+        const n = this.trail.length;
+        this.trail.forEach((p, i) => dot(p[0], p[1], this.r * (i + 1) / n, C.acc2, 0.3 * (i + 1) / n));
+        for (const p of this.parts) dot(p.x, p.y, 2, p.color, Math.min(1, p.life * 3));
+        if (!this.over) {
+          ctx.shadowColor = C.text; ctx.shadowBlur = 14;
+          dot(this.bx, this.by, this.r, C.text, this.serveT > 0 ? 0.4 + 0.4 * Math.sin(performance.now() / 90) : 1);
+          ctx.shadowBlur = 0;
+        }
+        if (this.waiting) overlay('Пинг-понг', `Мышь или W/S - ракетка · до ${this.target} очков · пробел / клик - старт`, H * 0.62);
+        else if (this.over) overlay(this.me > this.ai ? 'Победа!' : 'Поражение', `${this.me} : ${this.ai} · пробел - ещё раз`, H * 0.62);
+      }
+    });
+
+    // «Уклонись в ритм» (фон «Визуализатор») - атаки под собственный синтезированный трек
+    const CHORDS = [[110, 130.81, 164.81], [87.31, 110, 130.81], [130.81, 164.81, 196], [98, 123.47, 146.83]]; // Am F C G
+    const ARP = [0, 1, 2, 1, 0, 2, 1, 2];
+    const Beat = {
+      bpm: 128, ac: null, muted: loadNum('mgl.dodgeMute') === 1,
+      start() {
+        this.step16 = 0;
+        this.nextP = performance.now() + 80;
+        try {
+          const ac = new (window.AudioContext || window.webkitAudioContext)();
+          this.out = ac.createGain(); this.out.gain.value = this.muted ? 0 : 0.22; this.out.connect(ac.destination);
+          this.noise = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+          const d = this.noise.getChannelData(0);
+          for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+          this.ac = ac; this.next = ac.currentTime + 0.08;
+        } catch (e) { this.ac = null; }
+      },
+      stop() {
+        const ac = this.ac;
+        this.ac = null;
+        if (!ac) return;
+        try { this.out.gain.setTargetAtTime(0, ac.currentTime, 0.05); } catch (e) {}
+        setTimeout(() => { try { ac.close(); } catch (e) {} }, 300);
+      },
+      setMuted(m) {
+        this.muted = m; saveNum('mgl.dodgeMute', m ? 1 : 0);
+        if (this.ac) this.out.gain.setTargetAtTime(m ? 0 : 0.22, this.ac.currentTime, 0.03);
+      },
+      // планирует 16-е доли чуть вперёд; onStep(i, когда - в performance.now())
+      pump(onStep) {
+        const sp = 60 / this.bpm / 4;
+        // контекст без жеста пользователя может быть suspended - тогда ритм идёт по таймеру, без звука
+        if (this.ac && this.ac.state === 'suspended' && !this._resuming) {
+          this._resuming = true;
+          this.ac.resume().catch(() => {}).then(() => { this._resuming = false; });
+        }
+        if (this.ac && this.ac.state === 'running') {
+          const now = this.ac.currentTime;
+          if (this.next < now - 0.2) this.next = now + 0.05;
+          while (this.next < now + 0.12) {
+            this.play(this.step16, this.next);
+            onStep(this.step16, performance.now() + (this.next - now) * 1000);
+            this.next += sp; this.step16++;
+          }
+        } else {
+          const now = performance.now();
+          if (this.nextP < now - 200) this.nextP = now + 50;
+          while (this.nextP < now + 120) { onStep(this.step16, this.nextP); this.nextP += sp * 1000; this.step16++; }
+        }
+      },
+      tone(t, f, type, vol, dur, cut) {
+        const ac = this.ac, o = ac.createOscillator(), g = ac.createGain(), fl = ac.createBiquadFilter();
+        o.type = type; o.frequency.value = f; fl.type = 'lowpass'; fl.frequency.value = cut;
+        g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        o.connect(fl); fl.connect(g); g.connect(this.out); o.start(t); o.stop(t + dur + 0.02);
+      },
+      hit(t, type, f, vol, dur) {
+        const ac = this.ac, s = ac.createBufferSource(), fl = ac.createBiquadFilter(), g = ac.createGain();
+        s.buffer = this.noise; fl.type = type; fl.frequency.value = f;
+        g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        s.connect(fl); fl.connect(g); g.connect(this.out); s.start(t); s.stop(t + dur + 0.02);
+      },
+      kick(t) {
+        const ac = this.ac, o = ac.createOscillator(), g = ac.createGain();
+        o.frequency.setValueAtTime(150, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+        g.gain.setValueAtTime(1, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+        o.connect(g); g.connect(this.out); o.start(t); o.stop(t + 0.32);
+      },
+      play(i, t) {
+        const n = i % 16, bar = Math.floor(i / 16), sec = Beat.section(bar), ch = CHORDS[bar % 4];
+        const hard = sec >= 2, roll = (sec === 1 && bar % 4 === 3) || bar % this.LOOP === 19 || bar % this.LOOP === 27;
+        if (n % 4 === 0 && (sec > 0 || n % 8 === 0)) this.kick(t);
+        if (hard && (n === 4 || n === 12)) { this.hit(t, 'bandpass', 1800, 0.55, 0.16); this.tone(t, 190, 'triangle', 0.25, 0.08, 2000); }
+        if (roll && n >= 8) this.hit(t, 'bandpass', 2000, 0.12 + (n - 8) * 0.04, 0.08);
+        if (n % 2 === 0 || hard) this.hit(t, 'highpass', 7000, n % 4 === 2 ? 0.16 : 0.08, 0.05);
+        if (sec >= 1 && n % 2 === 1) this.tone(t, ch[0], 'sawtooth', 0.26, 0.17, 650);
+        if (sec === 2) this.tone(t, ch[ARP[n % 8]] * 4, 'square', 0.045, 0.12, 2600);
+        // фаза «окно»: плотный октавный бас и тёмное медленное арпеджио
+        if (sec === 3 && n % 2 === 0) this.tone(t, ch[0] * 2, 'sawtooth', 0.14, 0.1, 900);
+        if (sec === 3 && n % 4 === 0) this.tone(t, ch[ARP[(n / 4 + bar) % 8]] * 2, 'square', 0.06, 0.4, 1500);
+        // финал с бластерами: октавный бас + быстрое звенящее арпеджио
+        if (sec === 4 && n % 2 === 0) this.tone(t, ch[0] * 2, 'sawtooth', 0.16, 0.09, 1100);
+        if (sec === 4) this.tone(t, ch[ARP[(n * 5 + bar) % 8]] * 4, 'triangle', 0.09, 0.09, 3200);
+      },
+      // зарядка бластера (свист вверх) и залп через delay секунд
+      zap(delay) {
+        const ac = this.ac;
+        if (!ac || ac.state !== 'running') return;
+        const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+        o.type = 'sawtooth'; o.frequency.setValueAtTime(220, t); o.frequency.exponentialRampToValueAtTime(1100, t + delay);
+        g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.035, t + delay); g.gain.exponentialRampToValueAtTime(0.0001, t + delay + 0.05);
+        o.connect(g); g.connect(this.out); o.start(t); o.stop(t + delay + 0.1);
+        this.hit(t + delay, 'lowpass', 1400, 0.45, 0.35);
+      },
+      // 34 такта по кругу: 0–3 вступление, 4–7 нарастание, 8–19 дроп (14–19 - стены по бокам), 20–27 «окно»,
+      // 28–33 финал с бластерами по кругу
+      LOOP: 34,
+      section(bar) { const b = bar % this.LOOP; return b < 4 ? 0 : b < 8 ? 1 : b < 20 ? 2 : b < 28 ? 3 : 4; },
+      walls(bar) { const b = bar % this.LOOP; return b >= 14 && b < 20; }
+    };
+    // «Голос» Санса при печати текста: оригинальный блип из assets/audio/voice.mp3 на каждую букву
+    // (пока файл не загрузился или не декодировался - синтезированный блип). В игре идёт в общий выход трека
+    // (уважает M), вне игры - через свой AudioContext.
+    const Voice = {
+      ac: null, raw: null, bufs: new WeakMap(),
+      load() {
+        if (!this._loading) this._loading = new Promise(done => {
+          try {
+            const x = new XMLHttpRequest();   // XHR, а не fetch: в Electron страница открыта по file://
+            x.open('GET', 'assets/audio/voice.mp3'); x.responseType = 'arraybuffer';
+            x.onload = () => { if (x.response && x.response.byteLength) this.raw = x.response; done(); };
+            x.onerror = () => done();
+            x.send();
+          } catch (e) { done(); }
+        });
+        return this._loading;
+      },
+      // загрузить и декодировать заранее, чтобы первые буквы не прозвучали синтезом
+      ready() {
+        // шрифт Comic Sans (@font-face MglSans) canvas сам не подгрузит - просим заранее
+        try { if (document.fonts) document.fonts.load('17px MglSans').catch(() => {}); } catch (e) {}
+        return this.load().then(() => {
+          if (!this.raw) return;
+          // и для контекста трека (даже если он ещё suspended), и для того, куда звук пойдёт прямо сейчас
+          const list = [...new Set([Beat.ac, this.out()[0]])].filter(ac => ac && !(this.bufs.get(ac) instanceof AudioBuffer));
+          return Promise.all(list.map(ac => ac.decodeAudioData(this.raw.slice(0)).then(buf => this.bufs.set(ac, buf), () => {})));
+        });
+      },
+      // декодированный буфер под конкретный AudioContext (у трека игры и у Voice контексты разные)
+      buffer(ac) {
+        if (!this.raw) return null;
+        const b = this.bufs.get(ac);
+        if (b && b !== 'pending') return b;
+        if (!b) {
+          this.bufs.set(ac, 'pending');
+          ac.decodeAudioData(this.raw.slice(0)).then(buf => this.bufs.set(ac, buf), () => this.bufs.delete(ac));
+        }
+        return null;
+      },
+      out() {
+        if (Beat.ac && Beat.ac.state === 'running') return [Beat.ac, Beat.out];
+        try {
+          if (!this.ac) { this.ac = new (window.AudioContext || window.webkitAudioContext)(); this.gain = this.ac.createGain(); this.gain.gain.value = 0.9; this.gain.connect(this.ac.destination); }
+          if (this.ac.state === 'suspended') this.ac.resume().catch(() => {});
+          return [this.ac, this.gain];
+        } catch (e) { return [null, null]; }
+      },
+      blip() {
+        const [ac, dest] = this.out();
+        if (!ac) return;
+        const buf = this.buffer(ac);
+        if (buf) {
+          // новый блип обрывает предыдущий - как в оригинале, без наслоения
+          try { if (this.src) this.src.stop(); } catch (e) {}
+          const s = ac.createBufferSource();
+          s.buffer = buf; s.connect(dest); s.start();
+          this.src = s;
+          return;
+        }
+        const t = ac.currentTime + 0.005, f0 = 150 + Math.random() * 25;
+        const o = ac.createOscillator(), o2 = ac.createOscillator(), fl = ac.createBiquadFilter(), g = ac.createGain();
+        o.type = 'square'; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f0 * 0.8, t + 0.06);
+        o2.type = 'triangle'; o2.frequency.setValueAtTime(f0 * 2.02, t);
+        fl.type = 'lowpass'; fl.frequency.value = 1300; fl.Q.value = 5;
+        g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.22, t + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.075);
+        o.connect(fl); o2.connect(fl); fl.connect(g); g.connect(dest);
+        o.start(t); o2.start(t); o.stop(t + 0.09); o2.stop(t + 0.09);
+      },
+      // пауза после символа: на знаках препинания дольше, как в диалогах
+      delay(ch) { return /[.!?…]/.test(ch) ? 220 : /[,;:-]/.test(ch) ? 120 : 45; },
+      voiced(ch) { return /[0-9A-Za-zА-Яа-яЁё]/.test(ch); },
+      // проговорить строку без игры (кнопка в Дебаге)
+      say(text) {
+        clearTimeout(this._t);
+        let i = 0;
+        const tick = () => {
+          if (i >= text.length) return;
+          const ch = text[i++];
+          if (this.voiced(ch)) this.blip();
+          this._t = setTimeout(tick, this.delay(ch));
+        };
+        this.ready().then(tick);
+      }
+    };
+    const Dodge = Object.assign({}, gameBase, {
+      cursor: 'none',
+      best: loadNum('mgl.dodgeBest') / 10,
+      reset() {
+        if (!this.inited || this.waiting) this.newRound();
+        else { this.px = Math.min(this.px, W - this.pr); this.py = Math.min(this.py, H - this.pr); }
+        this.inited = W > 0;
+      },
+      newRound() {
+        Beat.stop();
+        this.px = W * 0.3; this.py = H * 0.5; this.pr = 7; this.hp = 3; this.inv = 0; this.dashT = 0; this.dashCd = 0;
+        this.dir = [1, 0]; this.trail = []; this.atk = []; this.sched = []; this.time = 0; this.pulse = 0; this.shake = 0; this.flash = 0;
+        this.walls = null; this.box = null; this.gAng = 0; this.caption = null;
+        this.over = false; this.waiting = true; this.cheat = false;
+        this.pushScore();
+      },
+      begin() { this.newRound(); this.waiting = false; Beat.start(); Voice.ready(); },
+      end() { Beat.stop(); gameBase.end.call(this); },
+      pushScore() {
+        hud([['Время', this.time.toFixed(1)], ['Рекорд', this.best.toFixed(1)], ['HP', '●'.repeat(Math.max(0, this.hp)) + '○'.repeat(Math.max(0, 3 - this.hp))]],
+          Beat.muted ? 'звук выкл · M' : '');
+      },
+      onKey(e) {
+        if (e.code === 'KeyM') { Beat.setMuted(!Beat.muted); this.pushScore(); return true; }
+        if (e.code === 'Space' || e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+          if (e.repeat) return true;
+          if (this.waiting || this.over) { if (e.code === 'Space') this.begin(); }
+          else if (this.dashCd <= 0) { this.dashT = 0.16; this.dashCd = 0.45; }
+          return true;
+        }
+        return !!KEYMAP[e.code];
+      },
+      onPointer(type) { if (type === 'pointerdown' && (this.waiting || this.over)) this.begin(); },
+      beatMs() { return 60000 / Beat.bpm; },
+      beam(vertical, pos, width) {
+        const now = performance.now(), b = this.beatMs();
+        this.atk.push({ kind: 'beam', vertical, pos, width, warn: now + b, hit: now + b * 1.4, gone: now + b * 1.8 });
+      },
+      ring(x, y, n, speed) {
+        const a0 = Math.random() * Math.PI;
+        for (let i = 0; i < n; i++) {
+          const a = a0 + i / n * Math.PI * 2;
+          this.atk.push({ kind: 'b', x, y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, r: 6 });
+        }
+      },
+      eq(fromTop) {
+        const now = performance.now(), b = this.beatMs(), n = 18, safe = irand(n);
+        const hs = Array.from({ length: n }, (_, i) => Math.abs(i - safe) <= 1 ? 0.06 : rand(0.15, 0.5));
+        this.atk.push({ kind: 'eq', fromTop, hs, warn: now + b, hit: now + b * 2, gone: now + b * 2.4 });
+      },
+      // Стены по бокам: столбик квадратов слева и справа, каждый ездит влево-вправо (фаза качания своя у ряда)
+      WALL_ROWS: 4,
+      wallDepth(side, i, now) {
+        const w = this.walls, b = this.beatMs();
+        if (!w) return 0;
+        const enter = Math.min(1, (now - w.start) / (b * 2)), leave = w.leave ? Math.max(0, 1 - (now - w.leave) / b) : 1;
+        const e = Math.min(enter, leave), ease = e * e * (3 - 2 * e);
+        const ph = now / b * Math.PI / 2 + i * 1.1 + (side > 0 ? Math.PI : 0);
+        return W * (0.07 + 0.13 * (0.5 + 0.5 * Math.sin(ph)) + 0.02 * this.pulse) * ease;
+      },
+      wallRects(now) {
+        const out = [], rows = this.WALL_ROWS, s = H / rows;
+        for (let i = 0; i < rows; i++) for (const side of [-1, 1]) {
+          const d = this.wallDepth(side, i, now);
+          if (d <= 0) continue;
+          out.push({ x: side < 0 ? d - s : W - d, y: i * s + 3, w: s, h: s - 6, side });
+        }
+        return out;
+      },
+      // Фаза «окно»: всё поле - гигантские блоки, свободен только маленький квадрат, который ползает по экрану
+      // окно = ровно одна клетка сетки блоков; сетка неподвижна и отцентрована, окно ходит на соседние клетки
+      BOX_CELL: 96,
+      boxStart(now) {
+        const b = this.beatMs(), cell = this.BOX_CELL;
+        const cols = Math.max(1, Math.floor(W / cell)), rows = Math.max(1, Math.floor(H / cell));
+        const gox = (W - cols * cell) / 2, goy = (H - rows * cell) / 2;
+        const ci = Math.max(0, Math.min(cols - 1, Math.floor((this.px - gox) / cell)));
+        const cj = Math.max(0, Math.min(rows - 1, Math.floor((this.py - goy) / cell)));
+        const cx = gox + (ci + 0.5) * cell, cy = goy + (cj + 0.5) * cell;
+        // смыкание растянуто на 6 долей, раскрытие - на 2
+        this.box = { cell, cols, rows, gox, goy, ci, cj, cx, cy, tx: cx, ty: cy, size: cell, start: now, shut: now + b * 6, open: now + b * 30, end: now + b * 32 };
+      },
+      boxMove() {
+        const bx = this.box;
+        if (bx.cx !== bx.tx || bx.cy !== bx.ty) return;
+        const opts = [[1, 0], [-1, 0], [0, 1], [0, -1]]
+          .map(([dx, dy]) => [bx.ci + dx, bx.cj + dy])
+          .filter(([i, j]) => i >= 0 && j >= 0 && i < bx.cols && j < bx.rows && !(i === bx.pi && j === bx.pj));
+        if (!opts.length) return;
+        const [i, j] = pick(opts);
+        bx.pi = bx.ci; bx.pj = bx.cj; bx.ci = i; bx.cj = j;
+        bx.tx = bx.gox + (i + 0.5) * bx.cell; bx.ty = bx.goy + (j + 0.5) * bx.cell;
+      },
+      boxRect(now) {
+        const bx = this.box;
+        if (!bx) return null;
+        const b = this.beatMs(), big = Math.max(W, H) * 2.2;
+        let k = 1;
+        if (now < bx.shut) k = (now - bx.start) / (bx.shut - bx.start);
+        else if (now > bx.open) k = 1 - (now - bx.open) / (bx.end - bx.open);
+        k = Math.max(0, Math.min(1, k)); k = k * k * (3 - 2 * k);
+        const s = big + (bx.size - big) * k;
+        return { x: bx.cx - s / 2, y: bx.cy - s / 2, s, closed: now >= bx.shut && now <= bx.open, k };
+      },
+      // Бластер: стоит за краем экрана и бьёт широким лучом по прямой через точку (cx, cy) в направлении ang.
+      // На экране видно только место входа луча (ex, ey) - там копится заряд.
+      gaster(ang, cx = W / 2, cy = H / 2) {
+        const now = performance.now(), b = this.beatMs(), dx = Math.cos(ang), dy = Math.sin(ang);
+        let t = Infinity;   // расстояние от точки назад до края экрана
+        if (dx > 1e-6) t = Math.min(t, cx / dx); else if (dx < -1e-6) t = Math.min(t, (cx - W) / dx);
+        if (dy > 1e-6) t = Math.min(t, cy / dy); else if (dy < -1e-6) t = Math.min(t, (cy - H) / dy);
+        if (!isFinite(t)) t = 0;
+        this.atk.push({
+          kind: 'gb', x: cx - dx * (t + 80), y: cy - dy * (t + 80), ex: cx - dx * t, ey: cy - dy * t, dx, dy, ang, w: 56,
+          born: now, warn: now + b * 1.25, hit: now + b * 1.8, gone: now + b * 2.2
+        });
+        Beat.zap(b * 1.25 / 1000);
+      },
+      // Финал (такты 28–33): прицельные залпы → вращающийся веер лучей через центр (бегать по кругу) → кресты
+      gasterBeat(gb, n, now) {
+        const P = Math.PI;
+        if (gb === 0 && n === 0) this.say('* Ты чувствуешь, как по спине пробегают мурашки.', 4);
+        if (gb === 0 && (n === 4 || n === 8 || n === 12)) this.gaster(rand(0, P * 2), this.px, this.py);
+        if (gb === 0 && n === 12) this.gAng = Math.atan2(this.py - H / 2, this.px - W / 2) + P / 2;
+        // Веер через центр. Скорость вращения везде 45° за долю, меняется только плотность лучей - без рывков.
+        // Разворот (такт 32) - шаг плавно уходит из +22.5° через 0 в −22.5° (косинус), а не переключается мгновенно.
+        let every = 0, step = 0;
+        if (gb === 1) { every = 4; step = P / 4; }
+        else if (gb === 2) { every = n < 8 ? 4 : 2; step = n < 8 ? P / 4 : P / 8; }
+        else if (gb === 3) { every = 2; step = P / 8; }
+        else if (gb === 4) { every = 2; step = P / 8 * Math.cos(P * n / 16); }
+        else if (gb === 5 && n < 8) { every = 2; step = -P / 8; }
+        if (every && n % every === 0) { this.gAng += step; this.gaster(this.gAng); }
+        // антикемпинг: у краёв и в углах луч веера почти не достаёт (там он далеко от центра, между лучами большие щели),
+        // поэтому, пока игрок жмётся к рамке, на каждой второй доле по нему бьют вдоль этой рамки - надо уходить внутрь
+        if (gb >= 1 && n % 4 === 2) {
+          const m = 80, nearX = this.px < m || this.px > W - m, nearY = this.py < m || this.py > H - m;
+          if (nearX) this.gaster(P / 2, this.px, this.py);
+          if (nearY) this.gaster(0, this.px, this.py);
+        }
+        // финальный крест - между последними лучами веера, после короткой паузы
+        if (gb === 5 && n === 10) for (let k = 0; k < 4; k++) this.gaster(this.gAng - P / 16 + k * P / 4);
+        if (gb === 5 && n === 14) this.say('* …а ты неплох.', 4);
+      },
+      // надпись в диалоговом окне: печатается по буквам под «голос»; hold - сколько долей висит после печати
+      say(text, hold) { this.caption = { text, shown: 0, next: performance.now(), hold: hold * this.beatMs(), until: Infinity }; },
+      drawBlaster(a, now) {
+        const b = this.beatMs(), GLOW = '#7fd8ff';
+        const firing = now >= a.warn, fade = now >= a.hit ? Math.max(0, 1 - (now - a.hit) / (a.gone - a.hit)) : 1;
+        const charge = firing ? 1 : Math.max(0, Math.min(1, (now - a.born) / (a.warn - a.born)));
+        const appear = Math.min(1, (now - a.born) / (b * 0.35));
+        const L = Math.hypot(W, H) * 1.4;
+        ctx.save();
+        ctx.translate(a.x, a.y); ctx.rotate(a.ang);
+        if (!firing) {
+          // прицел: пунктир по границам будущего луча + тонкая «нить» по центру, крепнет по мере заряда
+          ctx.globalAlpha = (0.2 + 0.18 * Math.sin(now / 50)) * appear; ctx.strokeStyle = C.text; ctx.lineWidth = 1; ctx.setLineDash([6, 6]);
+          ctx.beginPath(); ctx.moveTo(0, -a.w / 2); ctx.lineTo(L, -a.w / 2); ctx.moveTo(0, a.w / 2); ctx.lineTo(L, a.w / 2); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 0.45 * charge * appear; ctx.fillStyle = GLOW;
+          ctx.fillRect(0, -1 - charge, L, 2 + charge * 2);
+        } else {
+          // залп: в первые мгновения луч раскрывается от тонкого к полному
+          const open = Math.min(1, (now - a.warn) / 70);
+          const w = a.w * open * (now < a.hit ? 1 + 0.08 * Math.sin(now / 25) : fade);
+          ctx.globalAlpha = 0.95 * fade; ctx.fillStyle = '#fff'; ctx.shadowColor = GLOW; ctx.shadowBlur = 26;
+          ctx.fillRect(0, -w / 2, L, w);
+          ctx.shadowBlur = 0;
+        }
+        ctx.restore();
+        // точка входа на краю: светящийся заряд, при залпе - вспышка
+        const r = firing ? a.w * 0.75 * fade : 5 + 13 * charge;
+        ctx.save();
+        ctx.shadowColor = GLOW; ctx.shadowBlur = 18;
+        dot(a.ex, a.ey, r, firing ? '#fff' : GLOW, (firing ? 0.9 * fade : 0.35 + 0.5 * charge) * appear);
+        ctx.restore();
+        if (!firing) dot(a.ex, a.ey, 3 + 4 * charge * (0.7 + 0.3 * Math.sin(now / 45)), '#fff', appear);
+      },
+      onBeat(i) {
+        const n = i % 16, bar = Math.floor(i / 16), sec = Beat.section(bar), lvl = Math.floor(bar / Beat.LOOP), b = bar % Beat.LOOP;
+        const sp = 150 + lvl * 30, edge = () => pick([[rand(0, W), -10], [rand(0, W), H + 10], [-10, rand(0, H)], [W + 10, rand(0, H)]]);
+        const now = performance.now();
+        if (n % 4 === 0) this.pulse = 1;
+        if (n === 0 && b === 14) this.walls = { start: now, warn: now + this.beatMs() };
+        if (n === 0 && b === 20 && this.walls) this.walls.leave = now;
+        if (n === 0 && b === 20) this.boxStart(now);
+        if (n === 0 && (b < 20 || b >= 28) && this.box && now < this.box.open) { this.box.open = now; this.box.end = now + this.beatMs(); }
+        // окно переезжает на соседнюю клетку раз в такт (во второй половине фазы - раз в 2 доли), только доехав до прошлой
+        if (this.box && now > this.box.shut + 1 && n % (b >= 24 ? 8 : 16) === 0) this.boxMove();
+        if (sec === 4) this.gasterBeat(b - 28, n, now);
+        if (sec >= 3) return;
+        if (Beat.walls(bar)) {
+          // стены активны - без взрывных колец и эквалайзера, только лучи и падающие пули по центру
+          if (n === 0) this.beam(false, this.py, 40);
+          if (n === 8) this.beam(true, Math.max(W * 0.28, Math.min(W * 0.72, this.px)), 40);
+          if (n % 4 === 2) this.atk.push({ kind: 'b', x: rand(W * 0.3, W * 0.7), y: -10, vx: 0, vy: sp * 1.3, r: 6 });
+          return;
+        }
+        if (sec === 0) {
+          if (n === 0) this.beam(true, rand(W * 0.1, W * 0.9), 40);
+          if (n === 8) { const [x, y] = edge(); this.ring(x, y, 10, sp); }
+        } else if (sec === 1) {
+          if (n % 4 === 0) this.beam(n % 8 === 0, n % 8 === 0 ? this.px : this.py, 36);
+          if (n === 10) { const [x, y] = edge(); this.ring(x, y, 12, sp); }
+          if (bar % 4 === 3 && n >= 8 && n % 2 === 0) this.atk.push({ kind: 'b', x: rand(0, W), y: -10, vx: 0, vy: sp * 1.4, r: 5 });
+        } else {
+          // дроп до стен: эквалайзер и крест лучей чередуются по тактам, одно кольцо за такт и только с края
+          if (n === 0 && bar % 2 === 0) this.eq(bar % 4 === 2);
+          if (n === 8) { if (bar % 2) { this.beam(true, this.px, 44); this.beam(false, this.py, 44); } else this.beam(bar % 4 === 0, bar % 4 === 0 ? this.px : this.py, 40); }
+          if (n === 12) { const [x, y] = edge(); this.ring(x, y, 8 + lvl, sp * 0.9); }
+        }
+      },
+      hitPlayer() {
+        if (this.inv > 0 || this.dashT > 0 || this.over || god()) return;
+        this.hp--; this.inv = 1.4; this.shake = 0.35; this.flash = 0.25;
+        if (this.hp <= 0) {
+          this.over = true; Beat.stop();
+          if (this.time > this.best && !this.cheat) { this.best = this.time; saveNum('mgl.dodgeBest', Math.round(this.time * 10)); }
+        }
+        this.pushScore();
+      },
+      step() {
+        const dt = this.every / 1000, now = performance.now();
+        this.pulse = Math.max(0, this.pulse - dt * 3); this.shake = Math.max(0, this.shake - dt); this.flash = Math.max(0, this.flash - dt);
+        if (this.waiting || this.over) return;
+        if (god()) this.cheat = true;
+        Beat.pump((i, at) => this.sched.push({ i, at }));
+        while (this.sched.length && this.sched[0].at <= now) this.onBeat(this.sched.shift().i);
+        this.time += dt;
+        const cap = this.caption;
+        if (cap) {
+          if (cap.shown < cap.text.length && now >= cap.next) {
+            const ch = cap.text[cap.shown++];
+            if (Voice.voiced(ch)) Voice.blip();
+            cap.next = now + Voice.delay(ch);
+            if (cap.shown === cap.text.length) cap.until = now + cap.hold;
+          }
+          if (now > cap.until + this.beatMs()) this.caption = null;
+        }
+        // движение
+        let mx = 0, my = 0;
+        for (const c of held) { const d = KEYMAP[c]; if (d) { mx += d[0]; my += d[1]; } }
+        mx = Math.sign(mx); my = Math.sign(my);
+        if (mx || my) { const l = Math.hypot(mx, my); this.dir = [mx / l, my / l]; }
+        const v = 250 * (this.dashT > 0 ? 3.2 : 1);
+        if (this.dashT > 0) { this.px += this.dir[0] * v * dt; this.py += this.dir[1] * v * dt; this.dashT -= dt; }
+        else if (mx || my) { this.px += this.dir[0] * v * dt; this.py += this.dir[1] * v * dt; }
+        this.dashCd -= dt; this.inv -= dt;
+        this.px = Math.max(this.pr, Math.min(W - this.pr, this.px)); this.py = Math.max(this.pr, Math.min(H - this.pr, this.py));
+        this.trail.push([this.px, this.py, this.dashT > 0]);
+        if (this.trail.length > 10) this.trail.shift();
+        // атаки
+        const { px, py, pr } = this;
+        for (const a of this.atk) {
+          if (a.kind === 'b') {
+            a.x += a.vx * dt; a.y += a.vy * dt;
+            if (Math.hypot(a.x - px, a.y - py) < a.r + pr - 2) { a.dead = true; this.hitPlayer(); }
+          } else if (now >= a.warn && now < a.hit) {
+            if (a.kind === 'gb') {
+              const vx = px - a.x, vy = py - a.y;
+              if (vx * a.dx + vy * a.dy > 0 && Math.abs(vx * a.dy - vy * a.dx) < a.w / 2 + pr - 3) this.hitPlayer();
+            } else if (a.kind === 'beam') {
+              if (Math.abs((a.vertical ? px : py) - a.pos) < a.width / 2 + pr - 2) this.hitPlayer();
+            } else {
+              const bw = W / a.hs.length, i = Math.min(a.hs.length - 1, Math.floor(px / bw)), h = a.hs[i] * H;
+              if (a.fromTop ? py - pr < h : py + pr > H - h) this.hitPlayer();
+            }
+          }
+        }
+        this.atk = this.atk.filter(a => !a.dead && (a.kind === 'b' ? a.x > -40 && a.x < W + 40 && a.y > -40 && a.y < H + 40 : now < a.gone));
+        if (this.walls) {
+          if (this.walls.leave && now > this.walls.leave + this.beatMs()) this.walls = null;
+          else if (now >= this.walls.warn)
+            for (const r of this.wallRects(now))
+              if (px + pr - 2 > r.x && px - pr + 2 < r.x + r.w && py + pr - 2 > r.y && py - pr + 2 < r.y + r.h) { this.hitPlayer(); break; }
+        }
+        if (this.box) {
+          const bx = this.box;
+          if (now > bx.end) this.box = null;
+          else {
+            const lvl = Math.floor(Beat.step16 / 16 / Beat.LOOP), v = Math.min(170, 120 + lvl * 15) * dt;
+            const dx = bx.tx - bx.cx, dy = bx.ty - bx.cy, l = Math.hypot(dx, dy);
+            if (l > v) { bx.cx += dx / l * v; bx.cy += dy / l * v; } else { bx.cx = bx.tx; bx.cy = bx.ty; }
+            const r = this.boxRect(now);
+            if (r.closed && (px - pr < r.x - 2 || px + pr > r.x + r.s + 2 || py - pr < r.y - 2 || py + pr > r.y + r.s + 2)) this.hitPlayer();
+          }
+        }
+        if (Math.floor(this.time * 10) !== this._shown) { this._shown = Math.floor(this.time * 10); this.pushScore(); }
+      },
+      draw() {
+        const now = performance.now();
+        ctx.save();
+        if (this.shake > 0) ctx.translate(rand(-6, 6) * this.shake * 3, rand(-6, 6) * this.shake * 3);
+        drawGrid(24, 1.1, C.text, 0.1);
+        if (this.pulse > 0) {
+          ctx.globalAlpha = this.pulse * 0.35; ctx.strokeStyle = C.acc; ctx.lineWidth = 3;
+          ctx.strokeRect(1.5, 1.5, W - 3, H - 3);
+        }
+        for (const a of this.atk) {
+          if (a.kind === 'b') {
+            dot(a.x, a.y, a.r + 4, C.hot, 0.18); dot(a.x, a.y, a.r, C.hot, 1);
+            continue;
+          }
+          if (a.kind === 'gb') { this.drawBlaster(a, now); continue; }
+          const warn = now < a.warn, k = warn ? 1 - (a.warn - now) / this.beatMs() : 0;
+          const fade = now >= a.hit ? Math.max(0, 1 - (now - a.hit) / (a.gone - a.hit)) : 1;
+          if (a.kind === 'beam') {
+            const w = warn ? a.width : a.width * (1 + 0.25 * fade);
+            const x = a.vertical ? a.pos - w / 2 : 0, y = a.vertical ? 0 : a.pos - w / 2;
+            const rw = a.vertical ? w : W, rh = a.vertical ? H : w;
+            ctx.fillStyle = C.hot;
+            if (warn) {
+              ctx.globalAlpha = 0.08 + 0.12 * k * (0.6 + 0.4 * Math.sin(now / 40)); ctx.fillRect(x, y, rw, rh);
+              ctx.globalAlpha = 0.5; ctx.strokeStyle = C.hot; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, rw - 1, rh - 1);
+            } else {
+              ctx.globalAlpha = 0.95 * fade; ctx.fillRect(x, y, rw, rh);
+              ctx.globalAlpha = 0.8 * fade; ctx.fillStyle = '#fff';
+              if (a.vertical) ctx.fillRect(a.pos - w * 0.15, 0, w * 0.3, H); else ctx.fillRect(0, a.pos - w * 0.15, W, w * 0.3);
+            }
+          } else {
+            const bw = W / a.hs.length;
+            a.hs.forEach((hf, i) => {
+              const h = hf * H * (warn ? 1 : 0.92 + 0.08 * Math.sin(now / 60 + i)), x = i * bw + bw * 0.12, y = a.fromTop ? 0 : H - h;
+              ctx.fillStyle = C.hot;
+              if (warn) { ctx.globalAlpha = 0.12 + 0.1 * k; ctx.fillRect(x, y, bw * 0.76, h); }
+              else {
+                ctx.globalAlpha = 0.9 * fade; ctx.beginPath();
+                if (ctx.roundRect) ctx.roundRect(x, y, bw * 0.76, h, a.fromTop ? [0, 0, 6, 6] : [6, 6, 0, 0]); else ctx.rect(x, y, bw * 0.76, h);
+                ctx.fill();
+              }
+            });
+          }
+        }
+        if (this.walls) {
+          const warn = now < this.walls.warn;
+          for (const r of this.wallRects(now)) {
+            ctx.globalAlpha = warn ? 0.28 : 0.92; ctx.fillStyle = C.hot; ctx.beginPath();
+            if (ctx.roundRect) ctx.roundRect(r.x, r.y, r.w, r.h, 10); else ctx.rect(r.x, r.y, r.w, r.h);
+            ctx.fill();
+            // светлая кромка со стороны игрока
+            ctx.globalAlpha = warn ? 0.5 : 0.75; ctx.fillStyle = '#fff';
+            ctx.fillRect(r.side < 0 ? r.x + r.w - 4 : r.x, r.y + 8, 4, r.h - 16);
+          }
+        }
+        const hole = this.boxRect(now);
+        if (hole) {
+          ctx.save();
+          ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.rect(hole.x, hole.y, hole.s, hole.s);
+          ctx.clip('evenodd');
+          ctx.globalAlpha = 0.25 + 0.67 * hole.k; ctx.fillStyle = C.hot; ctx.fillRect(0, 0, W, H);
+          // «швы» между гигантскими блоками - та же неподвижная сетка, по клеткам которой ходит окно
+          const bx = this.box, cell = bx.cell, ox = bx.gox, oy = bx.goy;
+          ctx.globalAlpha = 0.35 * hole.k; ctx.strokeStyle = C.bg; ctx.lineWidth = 4; ctx.beginPath();
+          for (let x = ox; x < W; x += cell) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+          for (let y = oy; y < H; y += cell) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+          ctx.stroke();
+          ctx.restore();
+          ctx.globalAlpha = hole.closed ? 0.6 + 0.4 * this.pulse : 0.5; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+          ctx.strokeRect(hole.x - 1, hole.y - 1, hole.s + 2, hole.s + 2);
+        }
+        // игрок
+        const n = this.trail.length;
+        this.trail.forEach((p, i) => dot(p[0], p[1], this.pr * (i + 1) / n, p[2] ? C.text : C.acc2, (p[2] ? 0.45 : 0.18) * (i + 1) / n));
+        const blink = this.inv > 0 && Math.floor(now / 80) % 2 === 0;
+        if (!this.over && !blink) {
+          ctx.save();
+          ctx.translate(this.px, this.py); ctx.rotate(now / 400);
+          ctx.globalAlpha = 1; ctx.fillStyle = this.dashT > 0 ? C.text : C.acc2; ctx.shadowColor = C.acc2; ctx.shadowBlur = 12;
+          const s = this.pr * 1.7;
+          ctx.beginPath();
+          if (ctx.roundRect) ctx.roundRect(-s / 2, -s / 2, s, s, 3); else ctx.rect(-s / 2, -s / 2, s, s);
+          ctx.fill();
+          ctx.restore();
+        }
+        if (this.flash > 0) { ctx.globalAlpha = this.flash * 0.6; ctx.fillStyle = C.hot; ctx.fillRect(0, 0, W, H); }
+        ctx.restore();
+        const cap = this.caption;
+        if (cap && !this.over) {
+          // диалоговое окно в духе Undertale: чёрная плашка с белой рамкой, текст печатается по буквам, в конце гаснет
+          const a = cap.until === Infinity ? 1 : Math.max(0, Math.min(1, 1 - (now - cap.until) / this.beatMs()));
+          const bw = Math.min(W - 32, 600), bh = 54, bx = (W - bw) / 2, by = H - bh - 14;
+          ctx.globalAlpha = 0.92 * a; ctx.fillStyle = '#000'; ctx.fillRect(bx, by, bw, bh);
+          ctx.globalAlpha = a; ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.strokeRect(bx + 1.5, by + 1.5, bw - 3, bh - 3);
+          ctx.fillStyle = '#fff'; ctx.font = '17px MglSans, "Comic Sans MS", cursive'; ctx.textBaseline = 'middle';
+          let txt = cap.text.slice(0, cap.shown);
+          while (txt.length > 1 && ctx.measureText(txt).width > bw - 36) txt = txt.slice(1);
+          ctx.fillText(txt, bx + 18, by + bh / 2 + 1);
+          ctx.textBaseline = 'alphabetic';
+        }
+        if (this.waiting) overlay('Уклонись в ритм', 'WASD / стрелки - движение · Shift - рывок · M - звук · пробел - старт');
+        else if (this.over) overlay('Попадание!', `Продержались ${this.time.toFixed(1)} с · пробел - заново`);
+      }
+    });
+
+    // Пейнт по точкам (фон «Точечный шрифт»); рисунок хранится в localStorage индексами палитры - перекрашивается с темой
+    const Paint = Object.assign({}, gameBase, {
+      every: 1000 / 30, cursor: 'crosshair', gap: 14,
+      reset() {
+        const g = this.gap;
+        this.cols = Math.max(4, Math.floor(W / g)); this.rows = Math.max(4, Math.floor(H / g));
+        this.ox = (W - (this.cols - 1) * g) / 2; this.oy = (H - (this.rows - 1) * g) / 2;
+        if (!this.cells) this.load();
+        this.inited = W > 0;
+        this.pushScore();
+      },
+      colors() { return [C.acc, C.acc2, C.accTeal, C.accDim, C.warm, C.warm2, C.hot, C.text]; },
+      load() {
+        try { this.cells = new Map(Object.entries(JSON.parse(localStorage.getItem('mgl.dotPaint') || '{}').cells || {})); }
+        catch (e) { this.cells = new Map(); }
+        this.color = 0; this.brush = 1; this.erase = false; this.undo = []; this.pops = []; this.down = null; this.hover = null;
+      },
+      save() {
+        clearTimeout(this._saveT);
+        this._saveT = setTimeout(() => {
+          try { localStorage.setItem('mgl.dotPaint', JSON.stringify({ cells: Object.fromEntries(this.cells) })); } catch (e) {}
+        }, 400);
+      },
+      pushScore() {
+        hud([['Кисть', this.brush]], 'ЛКМ - рисовать · ПКМ - стереть · колесо - кисть · 1–8 - цвет · Ctrl+Z · C - очистить');
+      },
+      remember() { this.undo.push(new Map(this.cells)); if (this.undo.length > 40) this.undo.shift(); },
+      // палитра - внизу по центру
+      swatches() {
+        const n = this.colors().length + 1, gap = 28, x0 = W / 2 - (n - 1) * gap / 2, y = H - 24;
+        return Array.from({ length: n }, (_, i) => ({ x: x0 + i * gap, y, erase: i === n - 1, i }));
+      },
+      cell(x, y) { return [Math.round((x - this.ox) / this.gap), Math.round((y - this.oy) / this.gap)]; },
+      paintAt(x, y, erase) {
+        const [cx, cy] = this.cell(x, y), r = this.brush - 1;
+        for (let a = -r; a <= r; a++) for (let b = -r; b <= r; b++) {
+          if (a * a + b * b > r * r + r) continue;
+          const gx = cx + a, gy = cy + b;
+          if (gx < 0 || gy < 0 || gx >= this.cols || gy >= this.rows) continue;
+          const k = gx + ',' + gy;
+          if (erase) this.cells.delete(k);
+          else if (this.cells.get(k) !== this.color) { this.cells.set(k, this.color); this.pops.push({ k, t: 0 }); }
+        }
+      },
+      onPointer(type, x, y, e) {
+        this.hover = type === 'pointerleave' ? null : [x, y];
+        if (type === 'pointerdown') {
+          const sw = this.swatches().find(s => Math.hypot(s.x - x, s.y - y) < 12);
+          if (sw) { if (sw.erase) this.erase = !this.erase; else { this.color = sw.i; this.erase = false; } return; }
+          try { canvas.setPointerCapture(e.pointerId); } catch (er) {}
+          this.remember();
+          this.down = { erase: e.button === 2 || this.erase, x, y };
+          this.paintAt(x, y, this.down.erase);
+        } else if (type === 'pointermove' && this.down) {
+          // интерполяция, чтобы быстрый мазок не рвался
+          const d = this.down, steps = Math.ceil(Math.hypot(x - d.x, y - d.y) / (this.gap / 2));
+          for (let s = 1; s <= steps; s++) this.paintAt(d.x + (x - d.x) * s / steps, d.y + (y - d.y) * s / steps, d.erase);
+          d.x = x; d.y = y;
+        } else if ((type === 'pointerup' || type === 'pointercancel') && this.down) {
+          this.down = null; this.save();
+        }
+      },
+      onWheel(dy) { this.brush = Math.max(1, Math.min(4, this.brush + (dy > 0 ? -1 : 1))); this.pushScore(); },
+      ctrlKeys: ['KeyZ'],
+      onKey(e) {
+        if (e.code === 'KeyZ' && (e.ctrlKey || e.metaKey)) { const m = this.undo.pop(); if (m) { this.cells = m; this.save(); } return true; }
+        const dg = /^Digit([1-8])$/.exec(e.code);
+        if (dg) { this.color = +dg[1] - 1; this.erase = false; return true; }
+        if (e.code === 'KeyE') { this.erase = !this.erase; return true; }
+        if (e.code === 'BracketLeft' || e.code === 'BracketRight') { this.onWheel(e.code === 'BracketLeft' ? 1 : -1); return true; }
+        if (e.code === 'KeyC') { if (this.cells.size) { this.remember(); this.cells = new Map(); this.save(); } return true; }
+        return false;
+      },
+      step() { this.pops = this.pops.filter(p => (p.t += 1) < 8); },
+      draw() {
+        const g = this.gap, cols = this.colors();
+        drawGrid(g, 1.2, C.text, 0.14, this.ox, this.oy);
+        const pop = new Map(this.pops.map(p => [p.k, p.t]));
+        for (const [k, ci] of this.cells) {
+          const [gx, gy] = k.split(',').map(Number);
+          if (gx >= this.cols || gy >= this.rows) continue;
+          const t = pop.get(k), s = t == null ? 1 : 1.35 - 0.35 * t / 8;
+          dot(this.ox + gx * g, this.oy + gy * g, g * 0.38 * s, cols[ci] || C.acc, 0.95);
+        }
+        if (this.hover && !this.down) {
+          const [cx, cy] = this.cell(this.hover[0], this.hover[1]);
+          ctx.globalAlpha = 0.6; ctx.strokeStyle = this.erase ? C.text : cols[this.color]; ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.arc(this.ox + cx * g, this.oy + cy * g, g * (this.brush - 0.5), 0, Math.PI * 2); ctx.stroke();
+        }
+        // палитра
+        const sw = this.swatches(), x0 = sw[0].x - 16, x1 = sw[sw.length - 1].x + 16;
+        ctx.globalAlpha = 0.85; ctx.fillStyle = C.bg; ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(x0, H - 42, x1 - x0, 36, 18); else ctx.rect(x0, H - 42, x1 - x0, 36);
+        ctx.fill();
+        for (const s of sw) {
+          const active = s.erase ? this.erase : !this.erase && this.color === s.i;
+          if (s.erase) {
+            ctx.globalAlpha = 0.9; ctx.strokeStyle = C.text; ctx.lineWidth = 1.5;
+            ctx.beginPath(); ctx.arc(s.x, s.y, 7, 0, Math.PI * 2); ctx.moveTo(s.x - 5, s.y + 5); ctx.lineTo(s.x + 5, s.y - 5); ctx.stroke();
+          } else dot(s.x, s.y, 8, cols[s.i], 1);
+          if (active) { ctx.globalAlpha = 1; ctx.strokeStyle = C.text; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(s.x, s.y, 11.5, 0, Math.PI * 2); ctx.stroke(); }
+        }
+      }
+    });
+
+    // ---------- Луни: глаза-капсулы (высота = 3 ширины), моргают и «живут»; обычные скруглённые формы, не точки ----------
+    const rrect = (x, y, w, h, r) => {
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h);
+    };
+    // eyes: {w, cx, cy, gap}; st: {lx, ly (-1..1), open (0..1), happy (0..1), tall (множитель), tilt}
+    function drawLuniEyes(e, st) {
+      const h0 = e.w * 3, hp = st.happy || 0;
+      // радость: глаз сжимается до ~1.1 ширины и снизу вырезается круг - получается дуга ^
+      const h = Math.max(e.w * 0.16, (h0 + (e.w * 1.15 - h0) * hp) * st.open * st.tall), r = Math.min(e.w * 0.4, h / 2);
+      const dx = st.lx * e.w * 0.55, dy = st.ly * e.w * 0.7;
+      for (let i = 0; i < 2; i++) {
+        const sgn = i ? 1 : -1;
+        const cx = e.cx + sgn * (e.gap / 2 + e.w / 2) + dx, cy = e.cy + dy + st.tilt * sgn * e.w * 0.12;
+        const x = cx - e.w / 2, y = cy - h / 2;
+        ctx.save();
+        ctx.globalAlpha = 1;
+        if (st.rot) { ctx.translate(cx, cy); ctx.rotate(st.rot); ctx.translate(-cx, -cy); }
+        const gr = ctx.createLinearGradient(0, y, 0, y + h);
+        gr.addColorStop(0, C.acc2); gr.addColorStop(1, C.acc);
+        ctx.fillStyle = gr;
+        if (hp > 0.01) {
+          const R = e.w * 0.62, ccy = y + h + R * (0.25 + (1 - hp) * 2);
+          rrect(x, y, e.w, h, r); ctx.clip();
+          ctx.shadowBlur = 0;
+          ctx.beginPath(); ctx.rect(x - 4, y - 4, e.w + 8, h + 8); ctx.moveTo(cx + R, ccy); ctx.arc(cx, ccy, R, 0, Math.PI * 2);
+          ctx.fill('evenodd');
+        } else { rrect(x, y, e.w, h, r); ctx.fill(); }
+        ctx.restore();
+        // блик
+        if (st.open > 0.5 && hp < 0.3) {
+          ctx.globalAlpha = 0.35 * st.open; ctx.fillStyle = '#fff';
+          rrect(x + e.w * 0.2, y + h * 0.1, e.w * 0.22, Math.min(h * 0.22, e.w * 0.7), e.w * 0.11);
+          ctx.fill();
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+    const lunieyes = () => {
+      const w = Math.max(14, Math.min(H * 0.17, W * 0.07, 50));
+      return { w, gap: w * 0.95, cx: W * 0.73, cy: H * 0.44 };
+    };
+    const Luni = {
+      every: 1000 / 60, live: true, flat: false,
+      reset() {
+        this.t = 0; this.lx = this.ly = 0; this.tx = this.ty = 0; this.nextLook = 1; this.nextBlink = 2;
+        this.blinkT = -1; this.dbl = false; this.mood = 'idle'; this.moodT = 0; this.nextMood = 6;
+        this.open = 1; this.happy = 0; this.tall = 1; this.tilt = 0; this.tiltT = 0;
+      },
+      step() {
+        const dt = this.every / 1000;
+        this.t += dt;
+        if ((this.nextLook -= dt) <= 0 && this.mood !== 'sleep') {
+          this.tx = rand(-1, 1); this.ty = rand(-0.8, 0.8);
+          if (Math.random() < 0.3) this.tx = this.ty = 0;
+          this.nextLook = rand(0.8, 2.8);
+        }
+        if ((this.nextBlink -= dt) <= 0 && this.mood !== 'sleep') {
+          this.blinkT = 0; this.dbl = Math.random() < 0.25; this.nextBlink = rand(2, 5);
+        }
+        if (this.blinkT >= 0) {
+          this.blinkT += dt;
+          if (this.blinkT > 0.2) { if (this.dbl) { this.dbl = false; this.blinkT = 0; } else this.blinkT = -1; }
+        }
+        if ((this.nextMood -= dt) <= 0) {
+          this.mood = pick(['happy', 'surprise', 'sleep', 'tilt', 'dance', 'dance']); this.moodT = this.mood === 'sleep' ? rand(9, 13) : this.mood === 'dance' ? rand(7, 10) : rand(3, 4.5);
+          if (this.mood === 'surprise') { this.tx = this.ty = 0; }
+          this.nextMood = this.moodT + rand(14, 26);
+        }
+        if (this.moodT > 0 && (this.moodT -= dt) <= 0) this.mood = 'idle';
+        const m = this.mood, k = Math.min(1, dt * 9);
+        let open = 1, happy = 0, tall = 1, tilt = 0, rot = 0;
+        if (m === 'dance') rot = Math.sin(this.t * 4) * 0.24;
+        this.rot = (this.rot || 0) + (rot - (this.rot || 0)) * k;
+        if (this.blinkT >= 0) open = Math.abs(this.blinkT / 0.1 - 1) * 0.96 + 0.04;
+        if (m === 'happy') happy = 1;
+        else if (m === 'surprise') tall = 1.12;
+        else if (m === 'sleep') { open = 0.08; this.tx = this.ty = 0; tilt = 0; }
+        else if (m === 'tilt') { tilt = Math.sin(this.t * 6) * 1.2; }
+        else if (m === 'dance') {
+          // танец: наклоны и сдвиг вбок в такт, взгляд ходит из стороны в сторону (без движения вверх-вниз)
+          this.tx = Math.sin(this.t * 4) * 0.9; this.ty = -0.2; this.nextLook = 0.3;
+        }
+        this.open += (open - this.open) * (m === 'sleep' ? Math.min(1, dt * 2.5) : Math.min(1, dt * 26));
+        this.happy += (happy - this.happy) * k;
+        this.tall += (tall - this.tall) * k;
+        this.tilt += (tilt - this.tilt) * k;
+        this.lx += (this.tx - this.lx) * Math.min(1, dt * 12);
+        this.ly += (this.ty - this.ly) * Math.min(1, dt * 12);
+      },
+      draw() {
+        if (!this.open && this.open !== 0) this.reset();
+        const e = lunieyes();
+        const float = Math.sin(this.t * 1.6) * e.w * 0.06;
+        e.cy += float;
+        if (this.mood === 'dance') {
+          e.cy -= float;
+          e.cx += Math.sin(this.t * 4) * e.w * 0.5;
+        }
+        drawLuniEyes(e, this);
+        if (this.mood === 'dance') {
+          ctx.fillStyle = C.acc2; ctx.textAlign = 'center';
+          for (let i = 0; i < 4; i++) {
+            const p = ((this.t * 0.45 + i / 4) % 1), side = i % 2 ? 1 : -1;
+            ctx.globalAlpha = Math.sin(p * Math.PI) * 0.85;
+            ctx.font = `700 ${Math.round(e.w * (0.7 + (i % 3) * 0.15))}px sans-serif`;
+            ctx.fillText(i % 2 ? '♪' : '♫', e.cx + side * (e.gap / 2 + e.w * 1.6 + p * e.w * 1.2 + (i % 3) * e.w * 0.3) + Math.sin(p * 9 + i) * e.w * 0.25, e.cy - e.w * 0.3 - p * e.w * 2.4);
+          }
+          ctx.textAlign = 'start'; ctx.globalAlpha = 1;
+        }
+        if (this.mood === 'sleep') {
+          ctx.fillStyle = C.text; ctx.textAlign = 'center';
+          for (let i = 0; i < 3; i++) {
+            const p = ((this.t * 0.5 + i / 3) % 1);
+            ctx.globalAlpha = (1 - p) * 0.6; ctx.font = `700 ${Math.round(e.w * (0.35 + i * 0.12))}px sans-serif`;
+            ctx.fillText('z', e.cx + e.gap / 2 + e.w * 1.6 + p * e.w * 0.6 - e.w * 3.4, e.cy - e.w * 0.6 - p * e.w * 1.6);
+          }
+          ctx.textAlign = 'start'; ctx.globalAlpha = 1;
+        }
+      }
+    };
+
+    // Пасхалка фона «Луни»: «Лови светлячков» - Луни следит за курсором, ест светлячков и пугается искр
+    const LuniGame = Object.assign({}, gameBase, {
+      cursor: 'none', best: loadNum('mgl.luniBest'),
+      reset() { this.inited = W > 0; if (!this.eyes) this.newRound(); },
+      start() { gameBase.start.call(this); this.newRound(); },
+      newRound() {
+        this.px = W * 0.3; this.py = H * 0.5; this.mouse = null;
+        this.score = 0; this.lives = 3; this.flies = []; this.sparks = []; this.parts = [];
+        this.spawnT = 0.3; this.sparkT = 4; this.t = 0; this.over = false; this.waiting = true; this.cheat = false;
+        this.eyes = { lx: 0, ly: 0, open: 1, happy: 0, tall: 1, tilt: 0 }; this.mood = 0; this.blinkT = 2; this.hurt = 0;
+        this.pushScore();
+      },
+      pushScore() { hud([['Рекорд', this.best], ['Счёт', this.score || 0], ['Жизни', '♥'.repeat(Math.max(0, this.lives || 0)) || '-']]); },
+      press() { if (this.over) { this.newRound(); this.waiting = false; } else this.waiting = false; },
+      onKey(e) {
+        if (e.code === 'Space') { if (!e.repeat) this.press(); return true; }
+        if (KEYMAP[e.code]) { if (this.waiting) this.waiting = false; return true; }
+        return false;
+      },
+      onPointer(type, x, y) {
+        if (type === 'pointermove' || type === 'pointerdown') this.mouse = [x, y];
+        if (type === 'pointerdown') this.press();
+      },
+      step() {
+        const dt = this.every / 1000, E = this.eyes, e = lunieyes();
+        this.parts = this.parts.filter(p => (p.life -= dt) > 0);
+        for (const p of this.parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.94; p.vy *= 0.94; }
+        let ax = 0, ay = 0;
+        for (const c of held) { const d = KEYMAP[c]; if (d) { ax += d[0]; ay += d[1]; } }
+        if (ax || ay) { this.mouse = null; this.px += ax * 420 * dt; this.py += ay * 420 * dt; }
+        else if (this.mouse) { this.px += (this.mouse[0] - this.px) * Math.min(1, dt * 18); this.py += (this.mouse[1] - this.py) * Math.min(1, dt * 18); }
+        this.px = Math.max(8, Math.min(W - 8, this.px)); this.py = Math.max(8, Math.min(H - 8, this.py));
+        // глаза следят за курсором
+        const tx = Math.max(-1, Math.min(1, (this.px - e.cx) / (W * 0.4))), ty = Math.max(-1, Math.min(1, (this.py - e.cy) / (H * 0.4)));
+        E.lx += (tx - E.lx) * Math.min(1, dt * 10); E.ly += (ty - E.ly) * Math.min(1, dt * 10);
+        if ((this.blinkT -= dt) <= 0) { this.blink = 0.2; this.blinkT = rand(2, 4.5); }
+        let open = 1;
+        if (this.blink > 0) { this.blink -= dt; open = Math.abs(this.blink / 0.1 - 1) * 0.96 + 0.04; }
+        if (this.mood > 0) this.mood -= dt;
+        if (this.hurt > 0) this.hurt -= dt;
+        const happy = this.mood > 0 && this.hurt <= 0 ? 1 : 0, tall = this.hurt > 0 ? 1.15 : 1;
+        E.open += (open - E.open) * Math.min(1, dt * 26);
+        E.happy += (happy - E.happy) * Math.min(1, dt * 14);
+        E.tall += (tall - E.tall) * Math.min(1, dt * 14);
+        E.tilt = this.hurt > 0 ? Math.sin(this.t * 40) * 0.8 : E.tilt * 0.8;
+        if (this.waiting || this.over) return;
+        this.t += dt;
+        if (god()) this.cheat = true;
+        const lvl = Math.min(1, this.t / 60);
+        if ((this.spawnT -= dt) <= 0) {
+          this.spawnT = rand(0.55, 1.1) - lvl * 0.3;
+          this.flies.push({ x: rand(20, W - 20), y: rand(20, H - 20), a: rand(0, 6.28), life: rand(5, 8), ph: rand(0, 6.28) });
+        }
+        if ((this.sparkT -= dt) <= 0) {
+          this.sparkT = rand(1.2, 2.4) - lvl * 0.8;
+          const side = irand(4), v = 110 + lvl * 140 + rand(0, 40);
+          const s = side < 2 ? { x: side ? W + 10 : -10, y: rand(0, H) } : { x: rand(0, W), y: side === 2 ? -10 : H + 10 };
+          const a = Math.atan2(this.py - s.y + rand(-80, 80), this.px - s.x + rand(-80, 80));
+          this.sparks.push({ x: s.x, y: s.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 7 });
+        }
+        for (const f of this.flies) {
+          f.a += rand(-1.8, 1.8) * dt * 3; f.x += Math.cos(f.a) * 40 * dt; f.y += Math.sin(f.a) * 40 * dt; f.life -= dt; f.ph += dt * 5;
+          if (f.x < 10 || f.x > W - 10) f.a = Math.PI - f.a;
+          if (f.y < 10 || f.y > H - 10) f.a = -f.a;
+        }
+        this.flies = this.flies.filter(f => {
+          if (Math.hypot(f.x - this.px, f.y - this.py) < 20) {
+            this.score++; this.mood = 0.7;
+            for (let i = 0; i < 8; i++) { const a = rand(0, 6.28), v = rand(40, 150); this.parts.push({ x: f.x, y: f.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: rand(0.3, 0.6), color: C.warm2 }); }
+            this.pushScore();
+            return false;
+          }
+          return f.life > 0;
+        });
+        for (const s of this.sparks) { s.x += s.vx * dt; s.y += s.vy * dt; s.life -= dt; }
+        this.sparks = this.sparks.filter(s => {
+          if (this.hurt <= 0 && Math.hypot(s.x - this.px, s.y - this.py) < 15 && !god()) {
+            this.lives--; this.hurt = 0.8;
+            for (let i = 0; i < 12; i++) { const a = rand(0, 6.28), v = rand(60, 220); this.parts.push({ x: s.x, y: s.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: rand(0.3, 0.6), color: C.hot }); }
+            if (this.lives <= 0) {
+              this.over = true;
+              if (this.score > this.best && !this.cheat) { this.best = this.score; saveNum('mgl.luniBest', this.best); }
+            }
+            this.pushScore();
+            return false;
+          }
+          return s.life > 0 && s.x > -40 && s.x < W + 40 && s.y > -40 && s.y < H + 40;
+        });
+      },
+      draw() {
+        const e = lunieyes();
+        drawLuniEyes(e, this.eyes);
+        for (const f of this.flies) {
+          const a = Math.min(1, f.life) * (0.65 + 0.35 * Math.sin(f.ph));
+          ctx.shadowColor = C.warm2; ctx.shadowBlur = 12;
+          dot(f.x, f.y, 4.5, C.warm2, a);
+        }
+        for (const s of this.sparks) { ctx.shadowColor = C.hot; ctx.shadowBlur = 10; dot(s.x, s.y, 5, C.hot, 0.95); }
+        ctx.shadowBlur = 0;
+        for (const p of this.parts) dot(p.x, p.y, 2.2, p.color, Math.min(1, p.life * 2.5));
+        // курсор-светлячок игрока
+        const blink = this.hurt > 0 && Math.floor(this.hurt * 14) % 2;
+        if (!blink) { ctx.shadowColor = C.text; ctx.shadowBlur = 14; dot(this.px, this.py, 7, C.text, 1); ctx.shadowBlur = 0; }
+        if (this.waiting) overlay('Лови светлячков', 'мышь / WASD - двигаться · избегай красных искр · пробел - старт');
+        else if (this.over) overlay('Луни наелась!', `Поймано ${this.score} · пробел - заново`);
+      }
+    });
+
+    const SCENES = { snake: Snakes, land: Landscape, dots: DotFont, luni: Luni, dino: Dino, pong: Pong, dodge: Dodge, paint: Paint, lunigame: LuniGame };
 
     function resize() {
       const w = canvas.clientWidth, h = canvas.clientHeight;
@@ -3961,7 +5669,7 @@
         W = w; H = h;
         canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        if (!api.hold) scene.reset();
+        if (!api.hold || scene.inited === false) scene.reset();
         render();
       }
       return true;
@@ -3973,7 +5681,7 @@
     }
     function loop(t) {
       raf = requestAnimationFrame(loop);
-      if (!canvas || !canvas.isConnected) { stop(); return; }
+      if (!canvas || !canvas.isConnected) { if (scene && scene.end && scene.playing) scene.end(); stop(); return; }
       if (document.hidden) { last = 0; return; }
       if (!resize()) return;
       if (++colorAge > 120) { colorAge = 0; readColors(); }
@@ -3989,14 +5697,32 @@
       raf = 0;
       if (ro) { ro.disconnect(); ro = null; }
     }
+    function bindPointer(el) {
+      if (el._mglPtr) return;
+      el._mglPtr = true;
+      const fwd = e => {
+        if (el !== canvas || !scene.playing || !scene.onPointer) return;
+        const r = el.getBoundingClientRect();
+        scene.onPointer(e.type, e.clientX - r.left, e.clientY - r.top, e);
+      };
+      ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'pointerleave'].forEach(t => el.addEventListener(t, fwd));
+      el.addEventListener('contextmenu', e => { if (el === canvas && scene.playing) e.preventDefault(); });
+      el.addEventListener('wheel', e => {
+        if (el !== canvas || !scene.playing || !scene.onWheel) return;
+        e.preventDefault(); scene.onWheel(e.deltaY);
+      }, { passive: false });
+    }
     api.attach = function (el, mode) {
       stop();
+      if (scene && scene.end && scene.playing) scene.end();
+      prevScene = null;
       canvas = el; ctx = canvas.getContext('2d');
       scene = SCENES[mode] || Snakes;
       Snakes.playing = false; Snakes.ready = false; Snakes.flat = false; Snakes.aiA = Snakes.aiTarget = 1; Snakes.every = 120;
       clearTimeout(api._holdT); api.hold = false;
       W = H = 0; last = 0; acc = 0;
       readColors();
+      bindPointer(el);
       if (window.ResizeObserver) { ro = new ResizeObserver(() => { if (canvas) resize(); }); ro.observe(canvas); }
       raf = requestAnimationFrame(loop);
     };
@@ -4004,21 +5730,47 @@
     function relayout() {
       api.hold = true;
       clearTimeout(api._holdT);
-      api._holdT = setTimeout(() => { api.hold = false; if (canvas && canvas.isConnected && scene === Snakes) { scene.reset(); render(); } }, 520);
+      api._holdT = setTimeout(() => { api.hold = false; if (canvas && canvas.isConnected) { scene.reset(); render(); } }, 520);
     }
-    api.startGame = function () { if (scene !== Snakes) return; Snakes.startGame(); relayout(); };
-    api.stopGame = function () { if (scene !== Snakes) return; Snakes.stopGame(); relayout(); };
-    const KEYMAP = { ArrowUp: [0, -1], KeyW: [0, -1], ArrowDown: [0, 1], KeyS: [0, 1], ArrowLeft: [-1, 0], KeyA: [-1, 0], ArrowRight: [1, 0], KeyD: [1, 0] };
+    api.startGame = function (kind) {
+      if (!canvas) return;
+      if (kind === 'snake') { if (scene !== Snakes) return; Snakes.startGame(); relayout(); return; }
+      const g = SCENES[kind];
+      if (!g || !g.start) return;
+      if (scene !== g) { prevScene = scene; scene = g; }
+      held.clear();
+      g.inited = false;
+      if (W) g.reset();
+      g.start();
+      relayout();
+    };
+    api.stopGame = function () {
+      if (scene === Snakes) { Snakes.stopGame(); relayout(); return; }
+      if (!scene || !scene.end) return;
+      scene.end();
+      if (prevScene) { scene = prevScene; prevScene = null; relayout(); }
+      else stop();
+    };
     document.addEventListener('keydown', (e) => {
-      if (scene !== Snakes || !Snakes.playing || !canvas || !canvas.isConnected) return;
+      if (!scene || !scene.playing || !canvas || !canvas.isConnected) return;
       const t = e.target;
       if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return;
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
-      const d = KEYMAP[e.code];
-      if (!d) return;
-      e.preventDefault();
-      Snakes.turn(d);
+      if (e.altKey || ((e.ctrlKey || e.metaKey) && !(scene.ctrlKeys || []).includes(e.code))) return;
+      if (e.code === 'Escape') { if (api.onExit) api.onExit(); return; }
+      held.add(e.code);
+      if (scene.onKey && scene.onKey(e)) e.preventDefault();
     });
+    document.addEventListener('keyup', (e) => {
+      held.delete(e.code);
+      if (scene && scene.playing && scene.onKeyUp) scene.onKeyUp(e);
+    });
+    window.addEventListener('blur', () => held.clear());
+    // отладка: MglHeroScenes.scenes.pong, MglHeroScenes.tick(n) - n шагов + перерисовка (когда rAF не крутится)
+    api.scenes = SCENES;
+    api.beat = Beat;   // перемотка трека «Уклонись в ритм»: MglHeroScenes.beat.step16 = такт * 16
+    api.sansSay = text => Voice.say(text);
+    api.tick = n => { for (let i = 0; i < n; i++) scene.step(); render(); };
+    window.MglHeroScenes = api;
     return api;
   })();
 
@@ -4031,9 +5783,52 @@
     if (!box.isConnected) return;
     const row = (m) => {
       const p = r.pick && r.pick[m];
-      return `<div class="jf-row ${p ? 'ok' : 'no'}"><b>Java ${m}</b><span>${p ? escapeHtml(p) : 'не найдена — нажмите кнопку выше'}</span></div>`;
+      return `<div class="jf-row ${p ? 'ok' : 'no'}"><b>Java ${m}</b><span>${p ? escapeHtml(p) : 'не найдена - нажмите кнопку выше'}</span></div>`;
     };
-    box.innerHTML = [8, 17, 21, 25].map(row).join('');
+    const html = [8, 17, 21, 25].map(row).join('');
+    if (box.innerHTML !== html) box.innerHTML = html;
+    startJavaPoll();
+  }
+  // Пока открыты настройки (блок «найденные Java») или мастер установки - пересканируем каждые 2 с,
+  // чтобы только что установленная Java подхватывалась без перезапуска.
+  let _javaPollTimer = null;
+  function startJavaPoll() {
+    if (_javaPollTimer) return;
+    _javaPollTimer = setInterval(() => {
+      const box = document.getElementById('java-found');
+      const guide = _javaGuideMajor && document.querySelector('#app-modal #jg-status');
+      if (!box && !guide) { clearInterval(_javaPollTimer); _javaPollTimer = null; return; }
+      if (document.hidden) return;
+      if (box) refreshJavaFound();
+      if (guide) javaGuideCheck(true);
+    }, 2000);
+  }
+  let _javaGuideChecking = false;
+  async function javaGuideCheck(silent) {
+    const ipc = getIpc(), major = _javaGuideMajor;
+    const m = document.getElementById('app-modal');
+    const st = m && m.querySelector('#jg-status');
+    if (!ipc || !major || !st || _javaGuideChecking) return false;
+    _javaGuideChecking = true;
+    let r = null;
+    try { r = await ipc.invoke('java:scan'); } catch (e) {}
+    _javaGuideChecking = false;
+    const found = r && r.pick && r.pick[major <= 8 ? 8 : major];
+    if (!st.isConnected || _javaGuideMajor !== major) return false;
+    if (found) {
+      st.className = 'jg-status good';
+      st.textContent = 'Java найдена: ' + found;
+      toast(`Java ${major} найдена - можно запускать игру`);
+      refreshJavaFound();
+      _javaGuideMajor = 0;
+      setTimeout(() => { const w = document.getElementById('app-modal'); if (w && w.contains(st)) w.remove(); }, 900);
+      return true;
+    }
+    if (!silent) {
+      st.className = 'jg-status bad';
+      st.textContent = 'Java ещё не найдена. Завершите установку (Finish) - проверка идёт автоматически каждые 2 секунды.';
+    }
+    return false;
   }
   let _javaGuideMajor = 0;
   function showJavaGuide(major) {
@@ -4046,8 +5841,8 @@
       bodyHtml: `
         <div class="jg-why">Java ${major} не найдена. Рантайм Mojang в папке пользователя с кириллицей не запускается, поэтому нужна обычная установка Temurin в <code class="path">C:\\Program Files\\Eclipse Adoptium\\</code>.</div>
         <ol class="jg-steps">
-          <li>Нажмите <b>«Скачать установщик»</b> — лаунчер скачает Temurin ${major} с adoptium.net и откроет его.</li>
-          <li>Подтвердите запрос Windows и в мастере нажимайте <b>Next</b> — путь установки менять не нужно.</li>
+          <li>Нажмите <b>«Скачать установщик»</b> - лаунчер скачает Temurin ${major} с adoptium.net и откроет его.</li>
+          <li>Подтвердите запрос Windows и в мастере нажимайте <b>Next</b> - путь установки менять не нужно.</li>
           <li>Дождитесь <b>Finish</b>, вернитесь сюда и нажмите <b>«Проверить»</b>. Java подхватится автоматически.</li>
         </ol>
         <div class="jg-status" id="jg-status"></div>`,
@@ -4057,19 +5852,8 @@
         const ok = m.querySelector('.modal-ok');
         if (ok.dataset.stage === 'check') {
           api.disable();
-          const r = await ipc.invoke('java:scan');
+          await javaGuideCheck(false);
           api.enable(); ok.textContent = 'Проверить';
-          const found = r.pick && r.pick[major <= 8 ? 8 : major];
-          if (found) {
-            st.className = 'jg-status good';
-            st.textContent = 'Java найдена: ' + found;
-            toast(`Java ${major} найдена — можно запускать игру`);
-            refreshJavaFound();
-            setTimeout(() => { const w = document.getElementById('app-modal'); if (w) w.remove(); _javaGuideMajor = 0; }, 900);
-          } else {
-            st.className = 'jg-status bad';
-            st.textContent = 'Java ещё не найдена. Завершите установку (Finish) и нажмите «Проверить» снова.';
-          }
           return false;
         }
         api.disable();
@@ -4089,12 +5873,13 @@
         }
         Downloads.finish('java:' + major, { ok: true });
         st.className = 'jg-status good';
-        st.textContent = 'Установщик открыт. Пройдите мастер установки, затем нажмите «Проверить».';
+        st.textContent = 'Установщик открыт. Пройдите мастер установки - Java подхватится автоматически (проверка каждые 2 с).';
         ok.dataset.stage = 'check';
         ok.textContent = 'Проверить';
         return false;
       }
     });
+    startJavaPoll();
     const closeBtns = wrap.querySelectorAll('.modal-close, .modal-cancel');
     closeBtns.forEach(b => b.addEventListener('click', () => { _javaGuideMajor = 0; }));
     wrap.addEventListener('click', (e) => { if (e.target === wrap) _javaGuideMajor = 0; });
@@ -4124,8 +5909,8 @@
       if (!r || !r.ok) { sw.classList.toggle('on', !on); toast('Ошибка MGL S&C: ' + ((r && r.error) || '')); return; }
       D.settings = { ...(D.settings || {}), useMglSc: on };
       if (info) info.textContent = mglVersionsText(r.mods && r.mods.length ? r.mods : (await ipc.invoke('mglsc:info')).mods);
-      if (on) toast(r.warn || `MGL S&C включён — в mods/ добавлено: ${r.copied || 0}. Нужный мод включится при запуске`);
-      else toast(`MGL S&C отключён — удалено из mods/: ${r.removed || 0}${r.failed ? ` (не удалось: ${r.failed}, закройте игру)` : ''}`);
+      if (on) toast(r.warn || `MGL S&C включён - в mods/ добавлено: ${r.copied || 0}. Нужный мод включится при запуске`);
+      else toast(`MGL S&C отключён - удалено из mods/: ${r.removed || 0}${r.failed ? ` (не удалось: ${r.failed}, закройте игру)` : ''}`);
     });
   }
   function showNoticePlate(text) {
@@ -4200,6 +5985,7 @@
     bindMglSc();
     bindCustomCard();
     bindSettingsData();
+    bindDebugCard();
     content.querySelectorAll('[data-uipref]').forEach(sw => sw.addEventListener('click', () => {
       const key = sw.dataset.uipref;
       const on = !sw.classList.contains('on');
@@ -4210,6 +5996,8 @@
         if (rest) rest.classList.toggle('hidden', on);
       }
       applyUiPrefs();
+      const dbg = content.querySelector('#debug-card');
+      if (dbg && key === 'optimization') { dbg.innerHTML = debugCardHtml(); bindDebugCard(); }
       if (key === 'optimization' || key === 'noBackground') {
         const cur = content.querySelector('.bg-current');
         if (cur) renderBgCard();
@@ -4223,6 +6011,14 @@
     initUpdateButton();
     refreshUpdateButton(false);
     bindLaunchCard();
+    bindCrashCard();
+    const langSel = content.querySelector('#set-lang');
+    if (langSel) langSel.addEventListener('change', async () => {
+      const ipc = getIpc();
+      D.settings = { ...(D.settings || {}), language: langSel.value };
+      if (ipc) { try { await ipc.invoke('settings:save', { language: langSel.value }); } catch (e) {} }
+      if (window.MglI18n) MglI18n.change(langSel.value);        // сохраняет выбор в localStorage и перезагружает окно
+    });
     bindRailCard();
     initBgCard();
   }
@@ -4255,6 +6051,8 @@
       const hasCustom = window.MglIcons && MglIcons.get(inst.id);
       resetItem.style.display = hasCustom ? '' : 'none';
     }
+    const javaNote = menu.querySelector('[data-java-note]');
+    if (javaNote) javaNote.textContent = ((D.settings || {}).instanceJava || {})[inst.folder] ? 'своя' : '';
     UiBus.emit('instmenu:open', { inst, menu });
     menu.classList.remove('hidden');
     menu.style.visibility = 'hidden';
@@ -4278,6 +6076,7 @@
           else if (act === 'rename') renameInstance(inst);
           else if (act === 'pin') togglePinInstance(inst);
           else if (act === 'reset-icon') resetInstanceIcon(inst);
+          else if (act === 'java') instanceJavaModal(inst);
           else if (act === 'reinstall') reinstallInstance(inst);
           else if (act === 'delete') deleteInstance(inst);
         }));
@@ -4339,6 +6138,68 @@
     renderInstances();
     toast('Иконка сброшена');
   }
+  // Java для одной сборки: settings.instanceJava[folder] (main читает её в mc:launch раньше общей javaPath)
+  async function instanceJavaModal(inst) {
+    const ipc = getIpc();
+    if (!ipc) { toast('Выбор Java доступен только в приложении'); return; }
+    const label = inst.name || inst.folder;
+    const [det, scan] = await Promise.all([
+      ipc.invoke('java:detect', inst.folder).catch(() => null),
+      ipc.invoke('java:scan').catch(() => null)
+    ]);
+    const need = (det && det.major) || 17;
+    const cur = ((D.settings || {}).instanceJava || {})[inst.folder] || '';
+    const found = (scan && scan.list) || [];
+    const fits = (m) => need <= 8 ? m === 8 : m >= need;
+    const known = found.some(j => j.path === cur);
+    const opt = (v, text, sel) => `<option value="${escapeHtml(v)}" ${sel ? 'selected' : ''}>${escapeHtml(text)}</option>`;
+    const options = [opt('', `Автоматически (Java ${need})`, !cur)]
+      .concat(found.slice().sort((a, b) => (fits(b.major) - fits(a.major)) || (b.major - a.major))
+        .map(j => opt(j.path, `Java ${j.major} · ${j.vendor}${fits(j.major) ? '' : ' - не подходит'} · ${j.path}`, j.path === cur)))
+      .concat(cur && !known ? [opt(cur, 'Свой путь: ' + cur, true)] : [])
+      .concat([opt('__custom', 'Выбрать файл…', false)]);
+    const wrap = showModal({
+      title: 'Java для сборки',
+      bodyHtml: `
+        <div class="field-hint" style="margin:0 0 12px">Сборке <b>${escapeHtml(label)}</b> нужна <b>Java ${need}${need <= 8 ? '' : '+'}</b>. Выбор действует только для этой сборки и важнее пути из «Настройки → Java и память».</div>
+        <div class="field"><label class="field-label">Java</label>
+          <select id="ij-select">${options.join('')}</select></div>
+        <div class="jg-status" id="ij-status"></div>`,
+      okText: 'Сохранить',
+      onOk: async (m) => {
+        const val = m.querySelector('#ij-select').value;
+        if (val === '__custom') { toast('Выберите файл Java'); return false; }
+        const map = { ...((D.settings || {}).instanceJava || {}) };
+        if (val) map[inst.folder] = val; else delete map[inst.folder];
+        saveSettings({ instanceJava: map });
+        toast(val ? `Java для «${label}» сохранена` : `«${label}»: Java подбирается автоматически`);
+        return true;
+      }
+    });
+    const sel = wrap.querySelector('#ij-select'), st = wrap.querySelector('#ij-status');
+    const check = async () => {
+      const v = sel.value;
+      if (!v || v === '__custom') { st.className = 'jg-status'; st.textContent = ''; return; }
+      const r = await ipc.invoke('java:inspect', v).catch(() => null);
+      if (!r || !r.ok) { st.className = 'jg-status bad'; st.textContent = 'Файл не найден'; return; }
+      if (!r.ascii) { st.className = 'jg-status bad'; st.textContent = 'В пути есть кириллица - Java может не запуститься (could not open jvm.cfg)'; return; }
+      if (r.major && !fits(r.major)) { st.className = 'jg-status bad'; st.textContent = `Это Java ${r.major}, а сборке нужна Java ${need}${need <= 8 ? '' : '+'} - игра, скорее всего, не запустится`; return; }
+      st.className = 'jg-status good'; st.textContent = r.major ? `Java ${r.major} - подходит` : 'Версию Java определить не удалось';
+    };
+    sel.addEventListener('change', async () => {
+      if (sel.value !== '__custom') { check(); return; }
+      const picked = await ipc.invoke('dialog:pickJava');
+      if (!picked) { sel.value = cur || ''; check(); return; }
+      if (!Array.from(sel.options).some(o => o.value === picked)) {
+        const o = document.createElement('option');
+        o.value = picked; o.textContent = 'Свой путь: ' + picked;
+        sel.insertBefore(o, sel.querySelector('option[value="__custom"]'));
+      }
+      sel.value = picked;
+      sel.dispatchEvent(new Event('change'));
+    });
+    check();
+  }
   async function reinstallInstance(inst) {
     const label = inst.name || inst.folder;
     const ipc = getIpc();
@@ -4349,12 +6210,12 @@
     Downloads.start(taskId, 'mc', 'Переустановка: ' + label);
     const onProg = (e, d) => { if (d.folder === inst.folder) Downloads.update(taskId, { progress: d.progress, status: d.status }); };
     ipc.on('mc:reinstallProgress', onProg);
-    toast('Переустановка запущена — прогресс в трее загрузок');
+    toast('Переустановка запущена - прогресс в трее загрузок');
     const r = await ipc.invoke('mc:reinstall', inst.folder);
     ipc.removeListener('mc:reinstallProgress', onProg);
     if (!r || !r.ok) {
       Downloads.finish(taskId, { ok: false, error: (r && r.error) || 'ошибка' });
-      toast('Не удалось переустановить: ' + ((r && r.error) || ''));
+      toast(r && r.cancelled ? 'Переустановка отменена - старая версия возвращена' : 'Не удалось переустановить: ' + ((r && r.error) || ''));
       return;
     }
     Downloads.finish(taskId, { ok: true });
@@ -4383,7 +6244,10 @@
     }
   }
 
-  function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t == null ? '' : String(t); return d.innerHTML; }
+  // кавычки тоже: строка подставляется и в атрибуты (value="…", src="…") - иначе из названия с Modrinth можно вписать onfocus=…
+  function escapeHtml(t) {
+    return (t == null ? '' : String(t)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
   function formatPlaytime(seconds) {
     seconds = Math.max(0, Math.floor(seconds || 0));
     const h = Math.floor(seconds / 3600);
@@ -4413,7 +6277,8 @@
     const list = document.getElementById('instance-list');
     if (!list) return;
     if (!(D.instances && D.instances.length)) {
-      list.innerHTML = `<div class="sidebar-empty">Нет установленных версий</div>`;
+      list.innerHTML = `<div class="sidebar-empty">Нет установленных версий<br><button type="button" class="sidebar-empty-btn" data-empty-act="install-version">Установить версию</button>
+        <button type="button" class="sidebar-empty-btn" data-empty-act="create-pack">Создать сборку</button></div>`;
       return;
     }
     const q = _sidebarFilter.trim().toLowerCase();
@@ -4484,7 +6349,8 @@
     if (document.hasFocus() && !document.hidden) return false;
     try {
       if (!('Notification' in window) || Notification.permission === 'denied') return false;
-      const n = new Notification(title, { body, icon: 'assets/icons/icon.png' });
+      const tr = window.MglI18n ? MglI18n.t : (s) => s;
+      const n = new Notification(tr(title), { body: tr(body), icon: 'assets/icons/icon.png' });
       n.onclick = () => {
         const ipc = getIpc();
         if (ipc) ipc.send('focus-window'); else window.focus();
@@ -4547,8 +6413,8 @@
       ? news.map(n => `
         <div class="notif-item ${seen.has(newsKey(n)) || !_newsLoaded ? '' : 'unread'}">
           <div class="notif-dot"></div>
-          <div class="notif-body"><div class="notif-title">${escapeHtml(n.title)}</div>
-            <div class="notif-text">${escapeHtml(n.desc)}</div>
+          <div class="notif-body"><div class="notif-title" translate="no">${escapeHtml(newsText(n, 'title'))}</div>
+            <div class="notif-text" translate="no">${escapeHtml(newsText(n, 'desc'))}</div>
             ${n.url ? `<a class="notif-link" href="#" data-notif-url="${escapeHtml(n.url)}">Открыть ссылку</a>` : ''}</div>
         </div>`).join('')
       : `<div class="notif-empty">${I.box}<div>Пока нет новостей</div><div class="empty-sub">Здесь будут появляться обновления и анонсы</div></div>`;
@@ -4652,12 +6518,16 @@
       </div>
       <div class="toggle-row"><div><div class="tl">Полноэкранный режим</div><div class="ts">Сразу открывать игру на весь экран (--fullscreen)</div></div>
         <div class="switch ${o.fullscreen ? 'on' : ''}" data-lo-toggle="fullscreen"></div></div>
-      <div class="field lo-gap"><label class="field-label">Quick Play — куда зайти сразу после запуска</label>
+      <div class="field lo-gap"><label class="field-label">Окно лаунчера, когда игра запущена</label>
+        <select id="lo-win">${[['keep', 'Оставить как есть'], ['minimize', 'Свернуть в панель задач'], ['tray', 'Скрыть в трей']]
+          .map(([v, l]) => `<option value="${v}" ${((D.settings && D.settings.windowOnLaunch) || 'keep') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <div class="field-hint lo-hint">Когда закроется последняя запущенная игра, окно вернётся само.</div></div>
+      <div class="field lo-gap"><label class="field-label">Quick Play - куда зайти сразу после запуска</label>
         <div class="field-row">
           <select id="lo-qp-type">${qpOpt('none', 'Выключено')}${qpOpt('multiplayer', 'Сервер')}${qpOpt('singleplayer', 'Одиночный мир')}${qpOpt('realms', 'Realms')}</select>
           <input type="text" id="lo-qp-value" value="${escapeHtml(o.quickPlayValue)}" placeholder="${QP_PLACEHOLDER[o.quickPlayType] || ''}" ${o.quickPlayType === 'none' ? 'disabled' : ''}>
         </div>
-        <div class="field-hint lo-hint">Сервер работает на всех версиях (до 1.20 — через --server). Мир и Realms — только 1.20+. Кнопка «Играть» у сервера подставляет его автоматически.</div></div>
+        <div class="field-hint lo-hint">Сервер работает на всех версиях (до 1.20 - через --server). Мир и Realms - только 1.20+. Кнопка «Играть» у сервера подставляет его автоматически.</div></div>
       <div class="lo-sub">Хуки и обёртка</div>
       <div class="field"><label class="field-label">Pre-launch команда</label>
         <input type="text" id="lo-pre" value="${escapeHtml(o.preLaunch)}" placeholder="например: backup.bat" spellcheck="false">
@@ -4670,6 +6540,115 @@
         <div class="field-hint lo-hint">Выполняется после закрытия игры.</div></div>
       <div class="field-hint">Переменные окружения в командах: %INST_NAME%, %INST_DIR%, %INST_JAVA%, %INST_MC_VERSION%, в post-exit ещё %INST_EXIT_CODE%.</div>`;
   }
+  // ---- «Отчёты о сбоях и логи» (main: crash:* / logs:*, scripts/crash-reporter.js) ----
+  const fmtBytes = (b) => { b = +b || 0; return b >= 1073741824 ? (b / 1073741824).toFixed(1) + ' ГБ' : b >= 1048576 ? (b / 1048576).toFixed(1) + ' МБ' : b >= 1024 ? Math.round(b / 1024) + ' КБ' : b + ' Б'; };
+  const CRASH_KIND = { main: 'Лаунчер', rejection: 'Лаунчер', renderer: 'Окно', 'renderer-gone': 'Окно', unresponsive: 'Зависание', 'child-gone': 'Процесс', game: 'Игра', test: 'Тест' };
+  function copyText(t) {
+    try { window.require('electron').clipboard.writeText(t); return true; } catch (e) {}
+    try { navigator.clipboard.writeText(t); return true; } catch (e) { return false; }
+  }
+  function crashCardHtml() {
+    const s = D.settings || {};
+    const keep = s.logKeepDays == null ? 0 : +s.logKeepDays;
+    const logRow = (scope, title, sub) => `<div class="toggle-row"><div><div class="tl">${title}</div><div class="ts" data-log-info="${scope}">${sub}</div></div>
+      <div class="field-row log-btns"><button class="btn-secondary" data-log-open="${scope}">Папка</button><button class="btn-secondary danger" data-log-clear="${scope}">Очистить</button></div></div>`;
+    return `
+      <h3>Отчёты о сбоях и логи</h3>
+      <div class="field-hint" style="margin:0 0 12px">Если лаунчер или игра падают, подробности сохраняются в файл на этом компьютере. Ничего никуда не отправляется - отчёт можно открыть, скопировать и показать разработчикам. Имя пользователя в путях маскируется.</div>
+      ${notifPrefToggle('crashReports', 'Сохранять отчёты о сбоях', 'Падение игры, ошибки в окне и главном процессе, зависания', s)}
+      <div class="crash-head"><div class="lo-sub" style="margin:0">Отчёты</div>
+        <div class="field-row"><button class="btn-secondary" id="crash-open-dir">Папка</button><button class="btn-secondary" id="crash-test">Тестовый отчёт</button><button class="btn-secondary danger" id="crash-clear">Удалить все</button></div></div>
+      <div class="crash-list" id="crash-list"><div class="field-hint">Загрузка…</div></div>
+      <div class="lo-sub">Логи</div>
+      ${logRow('game-logs', 'Логи игры', 'logs/ в .minecraft и сборках')}
+      ${logRow('game-crashes', 'Отчёты самой игры', 'crash-reports/ в .minecraft и сборках')}
+      ${logRow('plugins', 'Логи плагинов', 'plugin-logs/')}
+      <div class="field lo-gap"><label class="field-label">Автоочистка логов и отчётов игры</label>
+        <select id="log-keep-days">${[[0, 'Не удалять'], [7, 'Старше 7 дней'], [14, 'Старше 14 дней'], [30, 'Старше 30 дней'], [90, 'Старше 90 дней']]
+          .map(([v, l]) => `<option value="${v}" ${keep === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <div class="field-hint lo-hint">Проверяется при запуске лаунчера. latest.log запущенной игры не удаляется.</div></div>`;
+  }
+  async function refreshCrashCard() {
+    const list = content.querySelector('#crash-list');
+    if (!list) return;
+    const ipc = getIpc();
+    if (!ipc) { list.innerHTML = '<div class="field-hint">Доступно в приложении</div>'; return; }
+    const r = await ipc.invoke('crash:list').catch(() => null);
+    if (!list.isConnected) return;
+    const items = (r && r.items) || [], seen = (r && r.seenTs) || 0;
+    list.innerHTML = items.length ? items.map(i => `
+      <div class="crash-item ${i.mtime > seen ? 'new' : ''}" data-crash="${escapeHtml(i.name)}" role="button" tabindex="0">
+        <span class="crash-kind">${CRASH_KIND[i.kind] || escapeHtml(i.kind)}</span>
+        <div class="crash-main"><div class="crash-sum">${escapeHtml(i.summary || i.name)}</div>
+          <div class="crash-meta">${new Date(i.mtime).toLocaleString(MGL_LOCALE)} · ${fmtBytes(i.size)}</div></div>
+        <button class="btn-ghost" data-crash-del title="Удалить" aria-label="Удалить отчёт">×</button>
+      </div>`).join('') : '<div class="field-hint">Сбоев не было - отчётов нет.</div>';
+    _crashUnseen = 0;
+    ipc.invoke('crash:seen');
+    const li = await ipc.invoke('logs:info').catch(() => null);
+    if (li) content.querySelectorAll('[data-log-info]').forEach(el => {
+      const x = li[el.dataset.logInfo];
+      if (x) el.textContent = x.count ? `${x.count} файлов · ${fmtBytes(x.size)}` : 'пусто';
+    });
+  }
+  async function openCrashReport(name) {
+    const ipc = getIpc();
+    const r = await ipc.invoke('crash:read', name).catch(() => null);
+    if (!r || !r.ok) { toast('Не удалось открыть отчёт'); return; }
+    const wrap = showModal({
+      title: name, wide: true, okText: 'Скопировать',
+      bodyHtml: `<pre class="crash-text">${escapeHtml(r.text)}</pre>`,
+      onOk: () => { toast(copyText(r.text) ? 'Отчёт скопирован' : 'Не удалось скопировать'); return false; }
+    });
+    wrap.querySelector('.modal-cancel').textContent = 'Закрыть';
+    const reveal = document.createElement('button');
+    reveal.className = 'btn-secondary'; reveal.textContent = 'Показать в папке';
+    reveal.addEventListener('click', () => ipc.send('crash:reveal', name));
+    wrap.querySelector('.modal-foot').prepend(reveal);
+  }
+  function bindCrashCard() {
+    const card = content.querySelector('#crash-card');
+    if (!card) return;
+    const ipc = getIpc();
+    refreshCrashCard();
+    const need = () => { if (ipc) return true; toast('Доступно в приложении'); return false; };
+    card.querySelector('#crash-open-dir').addEventListener('click', () => need() && ipc.send('crash:openDir'));
+    card.querySelector('#crash-test').addEventListener('click', async () => {
+      if (!need()) return;
+      const r = await ipc.invoke('crash:test');
+      if (!r || !r.ok) toast((r && r.error) || 'Не удалось создать отчёт');
+    });
+    card.querySelector('#crash-clear').addEventListener('click', async () => {
+      if (!need()) return;
+      if (!await confirmDialog({ title: 'Удалить отчёты', message: 'Удалить все сохранённые отчёты о сбоях лаунчера?', okText: 'Удалить', danger: true })) return;
+      await ipc.invoke('crash:clear');
+      refreshCrashCard();
+    });
+    const openItem = (e) => {
+      const item = e.target.closest('.crash-item');
+      if (!item || (e.type === 'keydown' && e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      if (e.target.closest('[data-crash-del]')) {
+        if (e.type === 'click') ipc.invoke('crash:remove', item.dataset.crash).then(refreshCrashCard);
+        return;
+      }
+      if (ipc) openCrashReport(item.dataset.crash);
+    };
+    card.querySelector('#crash-list').addEventListener('click', openItem);
+    card.querySelector('#crash-list').addEventListener('keydown', openItem);
+    card.querySelectorAll('[data-log-open]').forEach(b => b.addEventListener('click', () => need() && ipc.send('logs:open', b.dataset.logOpen)));
+    card.querySelectorAll('[data-log-clear]').forEach(b => b.addEventListener('click', async () => {
+      if (!need()) return;
+      const scope = b.dataset.logClear;
+      if (!await confirmDialog({ title: 'Очистить логи', message: 'Удалить все файлы в этой категории? Это нельзя отменить.', okText: 'Очистить', danger: true })) return;
+      const r = await ipc.invoke('logs:clear', scope);
+      toast(r && r.ok ? `Удалено файлов: ${r.removed} · освобождено ${fmtBytes(r.freed)}${r.locked ? ` · занято или используется: ${r.locked}` : ''}` : 'Ошибка: ' + ((r && r.error) || ''));
+      refreshCrashCard();
+    }));
+    const keep = card.querySelector('#log-keep-days');
+    keep.addEventListener('change', () => { saveSettings({ logKeepDays: parseInt(keep.value, 10) || 0 }); toast('Сохранено'); });
+  }
+
   function bindLaunchCard() {
     const card = content.querySelector('#launch-card');
     if (!card) return;
@@ -4694,6 +6673,8 @@
       preset.value = '';
       saveRes();
     });
+    const winSel = card.querySelector('#lo-win');
+    if (winSel) winSel.addEventListener('change', () => { saveSettings({ windowOnLaunch: winSel.value }); toast('Сохранено'); });
     const qpType = card.querySelector('#lo-qp-type'), qpVal = card.querySelector('#lo-qp-value');
     qpType.addEventListener('change', () => {
       qpVal.disabled = qpType.value === 'none';
@@ -4782,6 +6763,12 @@
         pop.querySelectorAll('[data-acc-tab]').forEach(t => t.classList.toggle('active', t === tab));
         pop.querySelectorAll('[data-pane]').forEach(p => p.classList.toggle('hidden', p.dataset.pane !== tab.dataset.accTab));
       }));
+    const regBtn = document.getElementById('acc-mgl-register');
+    if (regBtn) regBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const ipc = getIpc(), url = 'https://t.me/mglauncherbot';
+      if (ipc) ipc.send('open-url', url); else window.open(url, '_blank');
+    });
     const loginBtn = document.getElementById('acc-mgl-login');
     if (loginBtn) loginBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -4845,7 +6832,8 @@
   let _sessionTimer = null;
   function sessionsFromRunning(running) {
     return (running || []).map(r => {
-      const inst = (D.instances || []).find(i => i.folder === r.folder) || {};
+      const pack = String(r.folder).startsWith('inst:') ? (D.packs || []).find(p => 'inst:' + p.id === r.folder) : null;
+      const inst = pack ? { name: pack.name, ver: pack.mc, loaderName: LOADER[pack.loader] || pack.loader } : ((D.instances || []).find(i => i.folder === r.folder) || {});
       return {
         id: 'ses_' + r.folder,
         folder: r.folder,
@@ -5018,6 +7006,56 @@
     });
   }
 
+  // Кнопка «развернуть/восстановить» в шапке. Двойной клик по самой шапке (drag-зона) разворачивает окно средствами ОС.
+  function initMaximizeButton(ipc) {
+    const btn = document.getElementById('maximize-btn');
+    if (!btn) return;
+    if (!ipc) { btn.classList.add('hidden'); return; }
+    const MAX_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>';
+    const RESTORE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="8" width="12" height="12" rx="1.5"/><path d="M8 8V5.5A1.5 1.5 0 0 1 9.5 4H18.5A1.5 1.5 0 0 1 20 5.5V14.5A1.5 1.5 0 0 1 18.5 16H16"/></svg>';
+    const apply = (max) => {
+      btn.innerHTML = max ? RESTORE_ICON : MAX_ICON;
+      btn.title = max ? 'Восстановить' : 'Развернуть';
+      btn.setAttribute('aria-label', btn.title + ' окно');
+    };
+    const toggle = () => ipc.send('maximize-window');
+    btn.addEventListener('click', toggle);
+    btn.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+    ipc.on('window:state', (e, d) => apply(!!(d && d.maximized)));
+    ipc.invoke('window:isMaximized').then(apply).catch(() => {});
+  }
+
+  // ---- отчёты о сбоях: ловим ошибки окна и отдаём в main (scripts/crash-reporter.js) ----
+  function installErrorReporting() {
+    const ipc = getIpc();
+    if (!ipc) return;
+    const send = (kind, d) => { try { ipc.send('crash:renderer', { kind, view: currentView, ...d }); } catch (e) {} };
+    window.addEventListener('error', (e) => {
+      if (!e.error && !e.message) return;                       // ошибка загрузки ресурса - не сбой кода
+      if (/ResizeObserver loop/i.test(e.message || '')) return;
+      send('error', { message: e.message, stack: e.error && e.error.stack, source: e.filename, line: e.lineno, col: e.colno });
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      const r = e.reason;
+      send('unhandledrejection', { message: (r && r.message) || String(r), stack: r && r.stack });
+    });
+  }
+  let _crashUnseen = 0;
+  function onCrashReport(info) {
+    _crashUnseen++;
+    toast(info && info.kind === 'game' ? 'Игра завершилась с ошибкой - отчёт сохранён (Настройки → Отчёты о сбоях)' : 'Сбой записан в отчёт (Настройки → Отчёты о сбоях)');
+    if (currentView === 'settings') refreshCrashCard();
+  }
+  async function checkNewCrashReports() {
+    const ipc = getIpc();
+    if (!ipc) return;
+    try {
+      const r = await ipc.invoke('crash:list');
+      const fresh = ((r && r.items) || []).filter(i => i.mtime > (r.seenTs || 0));
+      if (fresh.length) toast(`Есть новые отчёты о сбоях: ${fresh.length} (Настройки → Отчёты о сбоях)`);
+    } catch (e) {}
+  }
+
   function bindGlobalNav() {
     document.querySelectorAll('[data-view]').forEach(el => {
       if (el.closest('#content') || el.closest('#rail-items') || el.classList.contains('profile-card')) return;
@@ -5028,6 +7066,11 @@
     const ipc = getIpc();
     document.getElementById('minimize-btn').addEventListener('click', () => ipc && ipc.send('minimize-window'));
     document.getElementById('close-btn').addEventListener('click', () => ipc && ipc.send('close-window'));
+    initMaximizeButton(ipc);
+    document.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-empty-act]');
+      if (b) { e.preventDefault(); emptyAction(b.dataset.emptyAct); }
+    });
 
     initNotifications();
 
@@ -5039,10 +7082,13 @@
         setLaunchProgress(100, 'Minecraft запущен!');
         const btn = document.getElementById('launch-btn'); if (btn) btn.disabled = false;
         toast('Игра запущена: ' + verLabel(d.folder));
-        // main уже записал lastVersion/launchCounts — синхронизируем локальную копию для «Продолжить играть»
-        const counts = { ...((D.settings && D.settings.launchCounts) || {}) };
-        counts[d.folder] = (counts[d.folder] || 0) + 1;
-        D.settings = { ...(D.settings || {}), lastVersion: d.folder, launchCounts: counts };
+        // main уже записал lastVersion/launchCounts - синхронизируем локальную копию для «Продолжить играть» (у сборок - своё)
+        if (!d.instance) {
+          const counts = { ...((D.settings && D.settings.launchCounts) || {}) };
+          counts[d.folder] = (counts[d.folder] || 0) + 1;
+          D.settings = { ...(D.settings || {}), lastVersion: d.folder, launchCounts: counts };
+        }
+        UiBus.emit('game:launched', d);
         gameLogOnLaunched(d.folder);
         setGameLogPanel(true);
         refreshSessions();
@@ -5054,14 +7100,16 @@
         toast('Ошибка запуска: ' + msg);
       });
       ipc.on('mc:log', (e, entry) => pushGameLog(entry));
+      ipc.on('crash:new', (e, info) => onCrashReport(info));
       ipc.on('mc:notice', (e, d) => showNoticePlate((d && d.text) || ''));
       ipc.on('java:missing', (e, d) => { if (d && d.major) showJavaGuide(d.major); });
       ipc.on('srv:log', (e, d) => onSrvLog(d));
       ipc.on('srv:state', (e, d) => onSrvState(d));
       ipc.on('mc:exit', (e, info) => {
         gameLogOnExit(info);
-        if (info.folder) D.settings = { ...(D.settings || {}), lastVersion: info.folder };
+        if (info.folder && !String(info.folder).startsWith('inst:')) D.settings = { ...(D.settings || {}), lastVersion: info.folder };
         refreshSessions();
+        UiBus.emit('game:exit', info);
         // синхронизируем счётчик времени
         if (info.playtimeSeconds != null && D.settings) {
           D.settings.playtimeSeconds = info.playtimeSeconds;
@@ -5113,7 +7161,7 @@
   const Downloads = (function () {
     const tasks = new Map();
     const subs = [];
-    const KIND_LABEL = { mc: 'MC', ml: 'Loader', java: 'Java', mr: 'Modrinth', upd: 'Update' };
+    const KIND_LABEL = { mc: 'MC', ml: 'Loader', java: 'Java', mr: 'Modrinth', upd: 'Update', pk: 'Сборка' };
     const AUTO_HIDE_MS = 6000;
 
     let _busyReported = -1;
@@ -5134,7 +7182,7 @@
       const existing = tasks.get(id);
       const t = existing || { id, kind, title, progress: 0, status: '', state: 'running', ts: Date.now() };
       t.kind = kind; t.title = title || t.title || id;
-      t.state = 'running'; t.progress = 0; t.status = ''; t.ts = Date.now();
+      t.state = 'running'; t.progress = 0; t.status = ''; t.ts = Date.now(); t.cancelling = false;
       tasks.set(id, t);
       emit();
       return t;
@@ -5143,7 +7191,7 @@
       const t = tasks.get(id);
       if (!t) return;
       if (patch.progress != null) t.progress = patch.progress;
-      if (patch.status != null) t.status = patch.status;
+      if (patch.status != null && !t.cancelling) t.status = patch.status;
       if (patch.title) t.title = patch.title;
       emit();
     }
@@ -5151,7 +7199,8 @@
       const t = tasks.get(id);
       if (!t) return;
       t.state = ok ? 'done' : 'error';
-      if (!ok && error) t.status = error;
+      if (!ok && error) t.status = /Отменено/i.test(error) ? 'Отменено' : error;
+      t.cancelling = false;
       if (ok) t.progress = 100;
       emit();
       const delay = ok ? AUTO_HIDE_MS : AUTO_HIDE_MS * 3;
@@ -5208,13 +7257,26 @@
           <div class="dl-item-head">
             <span class="dl-item-kind ${t.kind}">${KIND_LABEL[t.kind] || t.kind}</span>
             <span class="dl-item-title">${escapeHtml(t.title)}</span>
-            ${t.state !== 'running' ? `<button class="dl-item-close" data-dl-close="${escapeHtml(t.id)}" title="Убрать">×</button>` : ''}
+            ${t.state !== 'running' ? `<button class="dl-item-close" data-dl-close="${escapeHtml(t.id)}" title="Убрать">×</button>`
+              : cancellable(t) ? `<button class="dl-item-cancel" data-dl-cancel="${escapeHtml(t.id)}" title="Отменить загрузку" ${t.cancelling ? 'disabled' : ''}>${t.cancelling ? 'Отмена…' : 'Отменить'}</button>` : ''}
           </div>
           <div class="dl-item-bar"><div class="dl-item-fill" style="width:${Math.max(0, Math.min(100, t.progress || 0))}%"></div></div>
           <div class="dl-item-status">${escapeHtml(t.status || (t.state === 'done' ? 'Готово' : t.state === 'error' ? 'Ошибка' : '…'))}</div>
         </div>`).join('');
       bodyEl.querySelectorAll('[data-dl-close]').forEach(btn =>
         btn.addEventListener('click', () => remove(btn.dataset.dlClose)));
+      bodyEl.querySelectorAll('[data-dl-cancel]').forEach(btn =>
+        btn.addEventListener('click', (e) => { e.stopPropagation(); cancel(btn.dataset.dlCancel); }));
+    }
+    // id задачи = ключ задачи в main (runCancellable): установка версии/загрузчика, переустановка, фоновые ассеты
+    function cancellable(t) { return !!getIpc() && /^(mc|ml|re|assets|inst):/.test(t.id); }
+    async function cancel(id) {
+      const t = tasks.get(id), ipc = getIpc();
+      if (!t || !ipc || t.state !== 'running') return;
+      t.cancelling = true; t.status = 'Отмена…'; emit();
+      let r = null;
+      try { r = await ipc.invoke('install:cancel', id); } catch (e) {}
+      if (!r || !r.ok) { t.cancelling = false; emit(); toast('Эту загрузку уже нельзя отменить'); }
     }
 
     function bindIpc() {
@@ -5228,7 +7290,7 @@
         if (/^Ошибка/i.test(d.status || '')) finish(id, { ok: false, error: d.status });
         else if ((d.progress || 0) >= 100) finish(id, { ok: true });
       });
-      // фоновая докачка ассетов (звуки) после запуска игры — виден в трее, не блокирует игру
+      // фоновая докачка ассетов (звуки) после запуска игры - виден в трее, не блокирует игру
       ipc.on('assets:progress', (e, d) => {
         if (!d || !d.folder) return;
         const id = 'assets:' + d.folder;
@@ -5245,6 +7307,15 @@
         update(id, { progress: d.progress, status: d.status });
         if (/^Ошибка/i.test(d.status || '')) finish(id, { ok: false, error: d.status });
         else if ((d.progress || 0) >= 100) finish(id, { ok: true });
+      });
+      // создание сборки / установка модпака / восстановление версии (scripts/instances.js); id = ключ отмены inst:<id>
+      ipc.on('inst:progress', (e, d) => {
+        if (!d || !d.id) return;
+        const id = 'inst:' + d.id;
+        if (!tasks.has(id) || tasks.get(id).state !== 'running') start(id, 'pk', 'Сборка «' + (d.name || d.id) + '»');
+        update(id, { progress: d.progress, status: d.status });
+        if (/^Ошибка/i.test(d.status || '')) finish(id, { ok: false, error: d.status });
+        else if ((d.progress || 0) >= 100 && d.status === 'Готово') finish(id, { ok: true });
       });
       ipc.on('java:installProgress', (e, d) => {
         if (!d || d.major == null) return;
@@ -5271,8 +7342,11 @@
   window.MGL_UI = {
     D, views, TITLES, RAIL_DEFS, I, bus: UiBus, content,
     setView, get currentView() { return currentView; }, refresh: () => currentView && setView(currentView),
-    toast, notify, showModal, appConfirm, confirmDialog, escapeHtml, saveSettings, getIpc,
+    toast, notify, showModal, appConfirm, confirmDialog, confirmRemoveContent, escapeHtml, saveSettings, getIpc, fmtBytes, copyText,
     renderRail, renderInstances, hideInstMenu, doLaunch, verLabel, Downloads,
+    // для scripts/packs.js (Сборки)
+    LOADER, artFor, modrinthCard, fmtCount, decorateInstalled, fetchInstalledIndex, uiPrefs, showNoticePlate, formatPlaytime, cmpVer, openVersionPicker, setLaunchProgress,
+    get sessions() { return D.sessions || []; },
     reloadData: async () => { await loadData(); renderInstances(); updateSidebarCounts(); }
   };
 
@@ -5287,6 +7361,7 @@
         if (f) f.style.width = Math.max(4, Math.min(100, pct)) + '%';
         if (s && text) s.textContent = text;
       },
+      setUpdating(on) { const s = el(); if (s) s.classList.toggle('updating', !!on); },
       async hide(instant) {
         const s = el();
         if (!s) return;
@@ -5307,7 +7382,17 @@
     if (s) s.classList.toggle('static', uiPrefs().optimization);
   }
 
+  // Язык из settings.json (импорт настроек, очищенный localStorage) расходится с применённым в окне - один раз выравниваем
+  function syncLanguagePref() {
+    if (!window.MglI18n || !D.settings || !getIpc()) return;
+    const want = D.settings.language || 'auto';
+    if (want === MglI18n.pref) return;
+    try { if (sessionStorage.getItem('mgl.langSynced')) return; sessionStorage.setItem('mgl.langSynced', '1'); } catch (e) { return; }
+    MglI18n.change(want);
+  }
+
   async function init() {
+    installErrorReporting();
     window.addEventListener('dragover', (e) => e.preventDefault());
     window.addEventListener('drop', (e) => e.preventDefault());
     Splash.step(10, 'Загрузка настроек и сборок…');
@@ -5319,9 +7404,11 @@
     if (!timedOut) {
       Splash.step(55, 'Загрузка новостей…');
       await Promise.race([fetchNews().catch(() => {}), timeout]);
+      if (await splashAutoUpdate().catch(() => false)) return; // установщик запущен, лаунчер закрывается
     } else {
       dataReady.then(() => { renderInstances(); updateSidebarCounts(); renderRail(); setView(currentView); }).catch(() => {});
     }
+    syncLanguagePref();
     Splash.step(85, 'Подготовка интерфейса…');
     autoOptimizeForHardware();
     applyCurrentTheme();
@@ -5344,6 +7431,7 @@
     startSessionTicker();
     if (timedOut) toast('Часть данных ещё загружается…');
     Splash.hide();
+    setTimeout(checkNewCrashReports, 2500);
     if (window.MglPlugins) window.MglPlugins.boot().catch(e => console.error('[plugins] boot', e));
   }
   init().catch(e => { console.error('init failed', e); Splash.hide(); });

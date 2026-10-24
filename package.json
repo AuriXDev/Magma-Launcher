@@ -1,6 +1,6 @@
 {
   "name": "mgl2",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Magma Launcher",
   "main": "scripts/main.js",
   "scripts": {
@@ -27,12 +27,12 @@
       "!**/*.map"
     ],
     "extraResources": [
-      { "from": "assets/icon.ico", "to": "icon.ico" },
-      { "from": "PLUGINS.md", "to": "PLUGINS.md" }
+      { "from": "assets/icons/icon.ico", "to": "icon.ico" },
+      { "from": "docs/PLUGINS.md", "to": "PLUGINS.md" }
     ],
     "win": {
       "target": [{ "target": "nsis", "arch": ["x64"] }],
-      "icon": "assets/icon.ico",
+      "icon": "assets/icons/icon.ico",
       "artifactName": "MagmaLauncher-Setup-${version}.exe"
     },
     "nsis": {
@@ -41,8 +41,8 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Magma Launcher",
-      "installerIcon": "assets/icon.ico",
-      "uninstallerIcon": "assets/icon.ico",
+      "installerIcon": "assets/icons/icon.ico",
+      "uninstallerIcon": "assets/icons/icon.ico",
       "deleteAppDataOnUninstall": false
     }
   },

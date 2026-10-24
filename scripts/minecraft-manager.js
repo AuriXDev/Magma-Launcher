@@ -6,8 +6,15 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, execFile, execFileSync } = require('child_process');
 const zipExtract = require('./zip-extract');
+const { AsyncLocalStorage } = require('async_hooks');
+
+// Отмена установки: runCancellable(key, fn) кладёт токен в async-контекст, каждый _download/цикл
+// проверяет его через checkCancel() - сигнатуры install*-методов менять не нужно.
+const cancelCtx = new AsyncLocalStorage();
+function cancelledError() { const e = new Error('Отменено пользователем'); e.code = 'CANCELLED'; return e; }
+function checkCancel() { const t = cancelCtx.getStore(); if (t && t.cancelled) throw cancelledError(); }
 
 class MinecraftManager {
   constructor(minecraftDir, net) {
@@ -20,11 +27,34 @@ class MinecraftManager {
     this._net = net || null;
   }
   _jsonFetch(url) { return this._net ? this._net.json(url) : httpsJson(url); }
-  _download(url, dest, onProgress) { return this._net ? this._net.download(url, dest, onProgress) : downloadFile(url, dest, onProgress); }
+  async _download(url, dest, onProgress) {
+    checkCancel();
+    const r = await (this._net ? this._net.download(url, dest, onProgress) : downloadFile(url, dest, onProgress));
+    checkCancel();
+    return r;
+  }
+
+  runCancellable(key, fn) {
+    this._jobs = this._jobs || new Map();
+    const token = { key, cancelled: false, children: new Set() };
+    this._jobs.set(key, token);
+    return cancelCtx.run(token, () => Promise.resolve().then(fn))
+      .finally(() => { if (this._jobs.get(key) === token) this._jobs.delete(key); });
+  }
+  cancelJob(key) {
+    const t = this._jobs && this._jobs.get(key);
+    if (!t) return false;
+    t.cancelled = true;
+    t.children.forEach(c => { try { c.kill(); } catch (e) {} });
+    return true;
+  }
+  isJobCancelled(key) { const t = this._jobs && this._jobs.get(key); return !!(t && t.cancelled); }
+  activeJobs() { return this._jobs ? Array.from(this._jobs.keys()) : []; }
+  static isCancelled(err) { return !!(err && err.code === 'CANCELLED'); }
 
   getRunning() {
     return Array.from(this.processes.entries()).map(([folder, p]) => ({
-      folder, pid: p.child.pid, startedAt: p.startedAt
+      folder, pid: p.child.pid, startedAt: p.startedAt, version: p.version || folder
     }));
   }
 
@@ -152,7 +182,7 @@ class MinecraftManager {
     ensureDir(targetDir);
     let extracted = 0;
     for (const lib of (vdata.libraries || [])) {
-      if (!checkRules(lib.rules)) continue;
+      if (!libAllowed(lib)) continue;
       const key = nativeClassifier(lib);
       if (!key) continue;
       let src = null;
@@ -188,7 +218,7 @@ class MinecraftManager {
     const missing = [];
     (vdata.libraries || []).forEach(lib => {
       if (lib.natives) return;
-      if (!checkRules(lib.rules)) return;
+      if (!libAllowed(lib)) return;
       let p = null;
       if (lib.downloads && lib.downloads.artifact && lib.downloads.artifact.path) {
         p = path.join(this.librariesDir, lib.downloads.artifact.path);
@@ -204,7 +234,7 @@ class MinecraftManager {
     const cp = [];
     (vdata.libraries || []).forEach(lib => {
       if (lib.natives) return;
-      if (!checkRules(lib.rules)) return;
+      if (!libAllowed(lib)) return;
       let p = null;
       if (lib.downloads && lib.downloads.artifact && lib.downloads.artifact.path) {
         p = path.join(this.librariesDir, lib.downloads.artifact.path);
@@ -228,15 +258,19 @@ class MinecraftManager {
     const qp = ctx.quickPlay && ctx.quickPlay.type && ctx.quickPlay.value ? ctx.quickPlay : null;
     const map = {
       auth_player_name: ctx.username, version_name: vdata.id || vdata._id,
-      game_directory: this.minecraftDir, assets_root: this.assetsDir,
+      game_directory: ctx.gameDir || this.minecraftDir, assets_root: this.assetsDir,
       game_assets: this.assetsDir,
       assets_index_name: vdata.assets || 'legacy',
-      auth_uuid: '0', auth_access_token: '0', auth_session: '0',
+      auth_uuid: (() => { // офлайн-UUID как у сервера: md5("OfflinePlayer:<ник>"), иначе 1.21+ падает на "Invalid UUID string: 0"
+        const h = require('crypto').createHash('md5').update('OfflinePlayer:' + (ctx.username || 'Player')).digest();
+        h[6] = (h[6] & 0x0f) | 0x30; h[8] = (h[8] & 0x3f) | 0x80;
+        return h.toString('hex');
+      })(), auth_access_token: '0', auth_session: '0',
       user_properties: '{}', user_type: 'msa', version_type: vdata.type || 'release',
       resolution_width: String(res ? res.width : 854), resolution_height: String(res ? res.height : 480),
       clientid: '0', auth_xuid: '0', natives_directory: ctx.natives,
       launcher_name: 'MGL2', launcher_version: '2.0', classpath: ctx.classpath,
-      quickPlayPath: path.join(this.minecraftDir, 'quickPlay', 'log.json'),
+      quickPlayPath: path.join(ctx.gameDir || this.minecraftDir, 'quickPlay', 'log.json'),
       quickPlaySingleplayer: qp && qp.type === 'singleplayer' ? qp.value : '',
       quickPlayMultiplayer: qp && qp.type === 'multiplayer' ? qp.value : '',
       quickPlayRealms: qp && qp.type === 'realms' ? qp.value : ''
@@ -263,7 +297,7 @@ class MinecraftManager {
       });
     } else {
       out = ['--username', ctx.username, '--version', vdata.id || vdata._id,
-        '--gameDir', this.minecraftDir, '--assetsDir', this.assetsDir,
+        '--gameDir', ctx.gameDir || this.minecraftDir, '--assetsDir', this.assetsDir,
         '--assetIndex', vdata.assets || 'legacy', '--accessToken', '0', '--userType', 'msa'];
     }
     if (res && !out.includes('--width')) out.push('--width', String(res.width), '--height', String(res.height));
@@ -273,7 +307,7 @@ class MinecraftManager {
         const m = String(qp.value).match(/^\[?([^\]]+?)\]?(?::(\d+))?$/);
         out.push('--server', m ? m[1] : qp.value, '--port', (m && m[2]) || '25565');
       } else {
-        console.warn('[MGL2] Quick Play', qp.type, 'не поддерживается этой версией — пропущено');
+        console.warn('[MGL2] Quick Play', qp.type, 'не поддерживается этой версией - пропущено');
       }
     }
     return out;
@@ -287,7 +321,11 @@ class MinecraftManager {
       `-Dminecraft.launcher.brand=MGL2`
     ];
     if (vdata.arguments && vdata.arguments.jvm) {
-      const map = { natives_directory: natives, launcher_name: 'MGL2', launcher_version: '0.1', classpath: cp };
+      const map = { natives_directory: natives, launcher_name: 'MGL2', launcher_version: '0.1', classpath: cp,
+        // нужны Forge/NeoForge 1.17+: `-p ${library_directory}/...${classpath_separator}...` (модульный запуск)
+        library_directory: this.librariesDir, classpath_separator: path.delimiter,
+        // для ignoreList (`${version_name}.jar`) нужно имя клиентского jar (= версия MC), а не id профиля загрузчика
+        version_name: vdata._clientJar ? path.basename(vdata._clientJar, '.jar') : (vdata.inheritsFrom || vdata.id || vdata._id || ''), game_directory: ctx.gameDir || this.minecraftDir };
       const sub = (s) => s.replace(/\$\{(\w+)\}/g, (m, k) => (k in map ? map[k] : m));
       vdata.arguments.jvm.forEach(a => {
         if (typeof a === 'string') args.push(sub(a));
@@ -302,15 +340,17 @@ class MinecraftManager {
   async launchInstalled(name, opts) {
     const { javaPath, onProgress = () => {}, onLog = () => {} } = opts;
     const launch = opts.launch || {};
+    // gameDir - папка сборки (instances/<имя>), key - id процесса/логов (inst:<id>); по умолчанию общая .minecraft и имя версии
+    const gameDir = opts.gameDir || this.minecraftDir, key = opts.key || name;
     const hookEnv = {
-      INST_NAME: name, INST_ID: name, INST_DIR: this.minecraftDir, INST_MC_DIR: this.minecraftDir,
+      INST_NAME: name, INST_ID: key, INST_DIR: gameDir, INST_MC_DIR: this.minecraftDir,
       INST_JAVA: javaPath || '', INST_MC_VERSION: (() => { try { const v = this.resolveVersion(name); return v.assets || v.id || ''; } catch (e) { return ''; } })()
     };
     if (launch.preLaunch && String(launch.preLaunch).trim()) {
       onProgress(15, 'Pre-launch хук…');
-      onLog({ folder: name, stream: 'stdout', line: '[pre-launch] ' + launch.preLaunch });
-      const r = await runHook(launch.preLaunch, { cwd: this.minecraftDir, env: hookEnv, label: 'pre-launch', onLog: (e) => onLog({ folder: name, ...e }) });
-      if (r.code !== 0) throw new Error(`Pre-launch команда завершилась с кодом ${r.code}${r.error ? ': ' + r.error : ''} — запуск отменён`);
+      onLog({ folder: key, stream: 'stdout', line: '[pre-launch] ' + launch.preLaunch });
+      const r = await runHook(launch.preLaunch, { cwd: gameDir, env: hookEnv, label: 'pre-launch', onLog: (e) => onLog({ folder: key, ...e }) });
+      if (r.code !== 0) throw new Error(`Pre-launch команда завершилась с кодом ${r.code}${r.error ? ': ' + r.error : ''} - запуск отменён`);
     }
     try {
       const vd = this.resolveVersion(name);
@@ -323,30 +363,33 @@ class MinecraftManager {
           const r = await this.fetchAssetHashes(crit, { concurrency: 8, deadlineMs: 45000, onProgress: (p, d, t) => onProgress(18 + Math.floor(p * 0.02), `Докачка ассетов ${d}/${t}`) });
           const left = r.failed.concat(r.notStarted);
           if (left.length) {
-            onLog({ folder: name, stream: 'stderr', line: `[assets] ${left.length} файлов не успели — докачиваются в фоне` });
+            onLog({ folder: key, stream: 'stderr', line: `[assets] ${left.length} файлов не успели - докачиваются в фоне` });
             rest = rest.concat(left);
           }
         }
         if (rest.length) {
-          const started = this.startBackgroundAssets(name, rest, {
-            onProgress: (p, s) => (opts.onAssetsProgress || (() => {}))({ folder: name, progress: p, status: s, total: rest.length }),
+          const started = this.startBackgroundAssets(key, rest, {
+            onProgress: (p, s) => (opts.onAssetsProgress || (() => {}))({ folder: key, progress: p, status: s, total: rest.length }),
             onDone: (res) => {
-              (opts.onAssetsProgress || (() => {}))({ folder: name, progress: 100, status: res.failed ? `Не скачано файлов: ${res.failed}` : 'Готово', done: true, failed: res.failed, total: res.total });
-              onLog({ folder: name, stream: res.failed ? 'stderr' : 'stdout', line: `[assets] фон: ${res.total - res.failed}/${res.total}` });
+              (opts.onAssetsProgress || (() => {}))({ folder: key, progress: 100, status: res.cancelled ? 'Отменено - докачается при следующем запуске' : res.failed ? `Не скачано файлов: ${res.failed}` : 'Готово', done: true, failed: res.failed, total: res.total });
+              onLog({ folder: key, stream: res.failed ? 'stderr' : 'stdout', line: `[assets] фон: ${res.total - res.failed}/${res.total}` });
             }
           });
-          if (started) onLog({ folder: name, stream: 'stdout', line: `[assets] ${rest.length} файлов (звуки) докачиваются в фоне` });
+          if (started) onLog({ folder: key, stream: 'stdout', line: `[assets] ${rest.length} файлов (звуки) докачиваются в фоне` });
         }
       }
-    } catch (e) { onLog({ folder: name, stream: 'stderr', line: '[assets] проверка пропущена: ' + e.message }); }
+    } catch (e) { onLog({ folder: key, stream: 'stderr', line: '[assets] проверка пропущена: ' + e.message }); }
     return this._launchProcess(name, opts, hookEnv);
   }
 
   _launchProcess(name, opts, hookEnv) {
     const { username, memoryMax, javaPath, onProgress = () => {}, onLog = () => {}, onExit = () => {} } = opts;
     const launch = opts.launch || {};
+    const gameDir = opts.gameDir || this.minecraftDir, key = opts.key || name;
     return new Promise((resolve, reject) => {
       try {
+        if (this.processes.has(key)) throw new Error('Эта сборка уже запущена');
+        ensureDir(gameDir);
         if (!this.isVersionInstalled(name)) throw new Error(`Версия «${name}» не установлена`);
         onProgress(20, 'Чтение профиля…');
         const vdata = this.resolveVersion(name);
@@ -381,7 +424,7 @@ class MinecraftManager {
           ? { width: Math.round(+launch.resolution.width), height: Math.round(+launch.resolution.height) } : null;
         const ctx = {
           username: username || 'Player', memoryMax: memoryMax || 2048, natives, classpath,
-          resolution: res, fullscreen: !!launch.fullscreen, quickPlay: launch.quickPlay || null
+          resolution: res, fullscreen: !!launch.fullscreen, quickPlay: launch.quickPlay || null, gameDir
         };
         const jvm = this.buildJvmArgs(vdata, ctx);
         const game = this.buildGameArgs(vdata, ctx);
@@ -397,11 +440,11 @@ class MinecraftManager {
         console.log('[MGL2] args:', args.join(' '));
 
         const child = spawn(cmd, cmdArgs, {
-          cwd: this.minecraftDir,
+          cwd: gameDir,
           stdio: ['ignore', 'pipe', 'pipe']
         });
         const startedAt = Date.now();
-        this.processes.set(name, { child, startedAt });
+        this.processes.set(key, { child, startedAt, version: name, gameDir });
 
         const pipe = (stream, label) => {
           let buf = '';
@@ -412,10 +455,10 @@ class MinecraftManager {
             while ((idx = buf.indexOf('\n')) >= 0) {
               const line = buf.slice(0, idx).replace(/\r$/, '');
               buf = buf.slice(idx + 1);
-              if (line) onLog({ folder: name, stream: label, line });
+              if (line) onLog({ folder: key, stream: label, line });
             }
           });
-          stream.on('end', () => { if (buf) onLog({ folder: name, stream: label, line: buf }); });
+          stream.on('end', () => { if (buf) onLog({ folder: key, stream: label, line: buf }); });
         };
         pipe(child.stdout, 'stdout');
         pipe(child.stderr, 'stderr');
@@ -423,19 +466,19 @@ class MinecraftManager {
         let failed = false;
         child.on('error', (err) => {
           failed = true;
-          this.processes.delete(name);
+          this.processes.delete(key);
           reject(new Error('Ошибка запуска: ' + err.message));
         });
         child.on('exit', (code, signal) => {
           const ms = Date.now() - startedAt;
           const seconds = Math.max(0, Math.round(ms / 1000));
           const minutes = Math.floor(seconds / 60);
-          this.processes.delete(name);
-          onExit({ folder: name, code, signal, seconds, minutes });
+          this.processes.delete(key);
+          onExit({ folder: key, code, signal, seconds, minutes });
           if (launch.postExit && String(launch.postExit).trim()) {
             runHook(launch.postExit, {
-              cwd: this.minecraftDir, env: { ...hookEnv, INST_EXIT_CODE: String(code) }, label: 'post-exit',
-              onLog: (e) => onLog({ folder: name, ...e })
+              cwd: gameDir, env: { ...hookEnv, INST_EXIT_CODE: String(code) }, label: 'post-exit',
+              onLog: (e) => onLog({ folder: key, ...e })
             });
           }
         });
@@ -540,7 +583,7 @@ class MinecraftManager {
   }
 
   async downloadLibrariesList(libraries, onProgress, basePct = 0, spanPct = 50) {
-    const libs = (libraries || []).filter(l => checkRules(l.rules));
+    const libs = (libraries || []).filter(l => libAllowed(l));
     let i = 0;
     for (const lib of libs) {
       i++;
@@ -559,7 +602,7 @@ class MinecraftManager {
         if (!fs.existsSync(p)) {
           const url = libUrlFromName(lib.name, lib.url);
           try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch (e) {}
-          try { await this._download(url, p); } catch (e) { console.warn('lib fail', lib.name, e.message); }
+          try { await this._download(url, p); } catch (e) { if (MinecraftManager.isCancelled(e)) throw e; console.warn('lib fail', lib.name, e.message); }
         }
       }
     }
@@ -621,16 +664,36 @@ class MinecraftManager {
     return { ok: true, folder: id };
   }
 
+  // Все версии Forge для MC: recommended и latest сверху, дальше остальные по убыванию.
+  // maven-metadata.json: { "1.20.1": ["1.20.1-47.0.1", …], "1.7.10": ["1.7.10-10.13.4.1614-1.7.10", …] }
   async getForgeVersions(mcVersion) {
-    try {
-      const promos = await this._jsonFetch('https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json');
-      const list = [];
-      const rec = promos.promos && promos.promos[`${mcVersion}-recommended`];
-      const lat = promos.promos && promos.promos[`${mcVersion}-latest`];
-      if (rec) list.push({ version: rec, tag: 'recommended' });
-      if (lat && lat !== rec) list.push({ version: lat, tag: 'latest' });
-      return list;
-    } catch (e) { return []; }
+    const BASE = 'https://files.minecraftforge.net/net/minecraftforge/forge/';
+    const [promos, meta] = await Promise.all([
+      this._jsonFetch(BASE + 'promotions_slim.json').catch(() => null),
+      this._jsonFetch(BASE + 'maven-metadata.json').catch(() => this._jsonFetch('https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.json').catch(() => null))
+    ]);
+    const p = (promos && promos.promos) || {};
+    const rec = p[`${mcVersion}-recommended`], lat = p[`${mcVersion}-latest`];
+    const all = ((meta && meta[mcVersion]) || [])
+      .map(full => String(full).startsWith(mcVersion + '-') ? String(full).slice(mcVersion.length + 1) : null)
+      .filter(Boolean);
+    const num = (v) => String(v).split(/[-]/)[0].split('.').map(x => parseInt(x, 10) || 0);
+    all.sort((a, b) => { const x = num(a), y = num(b); for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (y[i] || 0) - (x[i] || 0); if (d) return d; } return 0; });
+    const list = [];
+    if (rec) list.push({ version: rec, tag: 'recommended' });
+    if (lat && lat !== rec) list.push({ version: lat, tag: 'latest' });
+    // в promotions версия без хвоста «-1.7.10», в metadata - с ним: сравниваем по числовой части
+    const promoted = new Set([rec, lat].filter(Boolean));
+    const isPromoted = (v) => promoted.has(v) || promoted.has(v.split('-')[0]);
+    all.forEach(v => {
+      if (isPromoted(v)) {
+        // у старых веток правильное имя артефакта - из metadata (с суффиксом), подменяем
+        list.forEach(x => { if (x.version === v.split('-')[0] && v.includes('-')) x.version = v; });
+        return;
+      }
+      list.push({ version: v, tag: '' });
+    });
+    return list;
   }
   async installForge(mcVersion, forgeVersion, javaPath, onProgress = () => {}) {
     if (!javaPath) throw new Error('Java не найдена - установите вручную в настройках или используйте авто-Java');
@@ -707,7 +770,7 @@ class MinecraftManager {
             await this._download(`${base}/${rel}`, dest);
             if (fs.existsSync(dest) && fs.statSync(dest).size > 1024) { ok = true; break; }
             try { fs.unlinkSync(dest); } catch (e) {}
-          } catch (e) {}
+          } catch (e) { if (MinecraftManager.isCancelled(e)) throw e; }
         }
       }
       done++;
@@ -767,6 +830,7 @@ class MinecraftManager {
           if (sz > 1024) { got = true; break; }
           try { fs.unlinkSync(dest); } catch (e) {}
         } catch (e) {
+          if (MinecraftManager.isCancelled(e)) throw e;
           // попробуем следующее зеркало
         }
       }
@@ -814,7 +878,10 @@ class MinecraftManager {
   _runInstaller(javaPath, installerJar, onProgress) {
     return new Promise((resolve, reject) => {
       const args = ['-jar', installerJar, '--installClient', this.minecraftDir];
+      checkCancel();
       const child = spawn(javaPath, args, { cwd: path.dirname(installerJar), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      const token = cancelCtx.getStore();
+      if (token) token.children.add(child);
       let out = '';
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
@@ -826,7 +893,9 @@ class MinecraftManager {
       child.stderr.on('data', c => { out += c; });
       child.on('error', reject);
       child.on('exit', (code) => {
-        if (code === 0) { onProgress(96, 'Installer завершён'); resolve(); }
+        if (token) token.children.delete(child);
+        if (token && token.cancelled) reject(cancelledError());
+        else if (code === 0) { onProgress(96, 'Installer завершён'); resolve(); }
         else reject(new Error(`installer exit ${code}: ${out.slice(-1500)}`));
       });
     });
@@ -890,14 +959,70 @@ class MinecraftManager {
       const root = path.join(base, dir);
       let ents = [];
       try { ents = fs.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory()); } catch (e) { return; }
-      ents.forEach(d => add(path.join(root, d.name), vendor, rank));
+      ents.forEach(d => {
+        const home = path.join(root, d.name);
+        add(home, vendor, rank);
+        // Azul/BellSoft и т.п. иногда кладут JDK уровнем глубже: Zulu\zulu-17\…
+        if (!fs.existsSync(path.join(home, 'bin'))) {
+          try { fs.readdirSync(home, { withFileTypes: true }).filter(x => x.isDirectory()).forEach(x => add(path.join(home, x.name), vendor, rank)); } catch (e) {}
+        }
+      });
     }));
-    if (process.env.JAVA_HOME) add(path.normalize(process.env.JAVA_HOME), 'JAVA_HOME', 3);
+    // Реестр (установщики Temurin/Oracle/Zulu/Microsoft пишут путь сюда) + свежие JAVA_HOME/PATH:
+    // process.env фиксируется при старте лаунчера, и Java, поставленная пока он открыт, иначе не находилась.
+    const reg = this._registryJavaHomes();
+    reg.homes.forEach(h => add(h, 'Registry', 2));
+    [process.env.JAVA_HOME, ...reg.javaHome].filter(Boolean).forEach(h => add(stripSep(h), 'JAVA_HOME', 3));
+    [...String(process.env.PATH || '').split(';'), ...reg.pathDirs].map(s => s.trim().replace(/^"|"$/g, '')).filter(Boolean).forEach(dir => {
+      const d = stripSep(dir);
+      if (/[\\/]bin$/i.test(d) && fs.existsSync(path.join(d, 'javaw.exe'))) add(path.dirname(d), 'PATH', 3);
+    });
     return out;
   }
 
-  findSystemJava(major) {
-    const ok = this.scanSystemJavas().filter(j => major <= 8 ? j.major === 8 : j.major >= major);
+  // Первый вызов - синхронно, дальше кеш обновляется в фоне не чаще раза в 4 с
+  // (UI опрашивает java:scan каждые 2 с, а reg.exe ~0.4 с - главный процесс блокировать нельзя).
+  _registryJavaHomes() {
+    const empty = { homes: [], javaHome: [], pathDirs: [] };
+    if (process.platform !== 'win32') return empty;
+    const keys = [
+      ['HKLM\\SOFTWARE\\JavaSoft', true], ['HKLM\\SOFTWARE\\Eclipse Adoptium', true], ['HKLM\\SOFTWARE\\Eclipse Foundation', true],
+      ['HKLM\\SOFTWARE\\AdoptOpenJDK', true], ['HKLM\\SOFTWARE\\Azul Systems', true], ['HKLM\\SOFTWARE\\Microsoft\\JDK', true],
+      ['HKLM\\SOFTWARE\\BellSoft', true], ['HKLM\\SOFTWARE\\Amazon Corretto', true], ['HKLM\\SOFTWARE\\WOW6432Node\\JavaSoft', true],
+      ['HKCU\\SOFTWARE\\JavaSoft', true],
+      ['HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment', false], ['HKCU\\Environment', false]];
+    const expand = (s) => s.replace(/%([^%]+)%/g, (m, k) => process.env[k] || m);
+    const parse = (outs) => {
+      const data = { homes: [], javaHome: [], pathDirs: [] };
+      outs.forEach((txt, i) => {
+        const env = !keys[i][1];
+        String(txt || '').split(/\r?\n/).forEach(l => {
+          const m = l.match(/^\s+(\S+)\s+REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/i);
+          if (!m) return;
+          const name = m[1], value = expand(m[2]);
+          if (!env) { if (/^(JavaHome|Path|InstallationPath)$/i.test(name)) data.homes.push(stripSep(value)); }
+          else if (/^JAVA_HOME$/i.test(name)) data.javaHome.push(value);
+          else if (/^Path$/i.test(name)) data.pathDirs.push(...value.split(';'));
+        });
+      });
+      return data;
+    };
+    const args = (k) => ['query', k[0], ...(k[1] ? ['/s'] : [])];
+    const opts = { encoding: 'utf8', timeout: 3000, windowsHide: true };
+    if (!this._regCache) {
+      const outs = keys.map(k => { try { return execFileSync('reg', args(k), { ...opts, stdio: ['ignore', 'pipe', 'ignore'] }); } catch (e) { return ''; } });
+      this._regCache = { ts: Date.now(), data: parse(outs) };
+    } else if (!this._regBusy && Date.now() - this._regCache.ts > 4000) {
+      this._regBusy = true;
+      Promise.all(keys.map(k => new Promise(r => execFile('reg', args(k), opts, (err, out) => r(err ? '' : out)))))
+        .then(outs => { this._regCache = { ts: Date.now(), data: parse(outs) }; })
+        .finally(() => { this._regBusy = false; });
+    }
+    return this._regCache.data;
+  }
+
+  findSystemJava(major, list) {
+    const ok = (list || this.scanSystemJavas()).filter(j => major <= 8 ? j.major === 8 : j.major >= major);
     ok.sort((a, b) => ((a.major === major ? 0 : 1) - (b.major === major ? 0 : 1)) || (a.rank - b.rank) || (a.major - b.major));
     return ok.length ? ok[0].javaw : null;
   }
@@ -917,7 +1042,7 @@ class MinecraftManager {
     const component = this.pickJavaComponent(major);
     const target = this.javaRuntimePath(component);
     if (!isAsciiPath(target)) {
-      const err = new Error(`Не найдена Java ${major}. Установите Eclipse Temurin ${major} (Adoptium) — рантайм Mojang не работает в пути с кириллицей.`);
+      const err = new Error(`Не найдена Java ${major}. Установите Eclipse Temurin ${major} (Adoptium) - рантайм Mojang не работает в пути с кириллицей.`);
       err.code = 'JAVA_MISSING'; err.major = major;
       throw err;
     }
@@ -1006,6 +1131,7 @@ class MinecraftManager {
           return true;
         } catch (e) {
           try { fs.unlinkSync(tmp); } catch (e2) {}
+          if (MinecraftManager.isCancelled(e)) throw e;
           if (a < 2) await sleep(400 * (a + 1));
         }
       }
@@ -1015,6 +1141,7 @@ class MinecraftManager {
     let i = 0, done = 0;
     const worker = async () => {
       while (i < hashes.length) {
+        checkCancel();
         if (deadlineMs && Date.now() - started > deadlineMs) return;
         const h = hashes[i++];
         if (!(await fetchOne(h))) failed.push(h);
@@ -1034,11 +1161,12 @@ class MinecraftManager {
     const plan = this.assetPlan(vdata, { verify: !!opts.verify });
     const hashes = plan.need.map(it => it.hash);
     if (!hashes.length) return { total: plan.total, missing: 0, failed: 0 };
-    const r = await this.fetchAssetHashes(hashes, { concurrency: 6, onProgress: (p, d, t) => onProgress(p, `Ассеты ${d}/${t}`) });
+    const r = await this.fetchAssetHashes(hashes, { concurrency: opts.concurrency || 8, onProgress: (p, d, t) => onProgress(p, `Ассеты ${d}/${t}`) });
     let failed = r.failed;
     if (failed.length) {
       onProgress(99, `Повторная докачка: ${failed.length}`);
       await new Promise(res => setTimeout(res, 1500));
+      checkCancel();
       failed = (await this.fetchAssetHashes(failed, { concurrency: 2 })).failed;
     }
     return { total: plan.total, missing: hashes.length, failed: failed.length };
@@ -1048,19 +1176,21 @@ class MinecraftManager {
     this._assetJobs = this._assetJobs || new Set();
     if (!hashes.length || this._assetJobs.has(key)) return false;
     this._assetJobs.add(key);
-    (async () => {
-      let failed = [];
+    // ключ отмены 'assets:<папка>' совпадает с id задачи в трее загрузок
+    this.runCancellable('assets:' + key, async () => {
+      let failed = [], cancelled = false;
       try {
         const r = await this.fetchAssetHashes(hashes, { concurrency: 4, onProgress: (p, d, t) => onProgress(p, `Ассеты (звуки): ${d}/${t}`) });
         failed = r.failed;
         if (failed.length) {
           await new Promise(res => setTimeout(res, 3000));
+          checkCancel();
           failed = (await this.fetchAssetHashes(failed, { concurrency: 2 })).failed;
         }
-      } catch (e) { failed = hashes; }
+      } catch (e) { failed = hashes; cancelled = MinecraftManager.isCancelled(e); }
       this._assetJobs.delete(key);
-      onDone({ total: hashes.length, failed: failed.length });
-    })();
+      onDone({ total: hashes.length, failed: failed.length, cancelled });
+    }).catch(() => {});
     return true;
   }
 
@@ -1086,7 +1216,7 @@ class MinecraftManager {
       verifyHash(jarPath, client.sha1);
     }
 
-    const libs = (vdata.libraries || []).filter(l => checkRules(l.rules));
+    const libs = (vdata.libraries || []).filter(l => libAllowed(l));
     const nativesDir = path.join(versionDir, 'natives');
     ensureDir(nativesDir);
     let i = 0;
@@ -1108,7 +1238,7 @@ class MinecraftManager {
         if (!fs.existsSync(p)) {
           const url = libUrlFromName(lib.name, lib.url);
           try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch (e) {}
-          try { await this._download(url, p); } catch (e) { console.warn('lib fail', lib.name, e.message); }
+          try { await this._download(url, p); } catch (e) { if (MinecraftManager.isCancelled(e)) throw e; console.warn('lib fail', lib.name, e.message); }
         }
       }
       const key = nativeClassifier(lib);
@@ -1159,7 +1289,8 @@ function nativeClassifier(lib) {
   if (!n) return null;
   const osn = n[process.platform === 'win32' ? 'windows' : (process.platform === 'darwin' ? 'osx' : 'linux')];
   if (!osn) return null;
-  return osn.replace('${arch}', process.arch === 'x64' ? '64' : '32');
+  // ${arch} у legacy-нативов - только 32/64; arm64 JVM всё равно 64-битная
+  return osn.replace('${arch}', process.arch === 'ia32' ? '32' : '64');
 }
 function libUrlFromName(name, baseUrl) {
   const parts = name.split(':');
@@ -1189,23 +1320,56 @@ function pct(done, total, span) {
 
 function ensureDir(d) { try { fs.mkdirSync(d, { recursive: true }); } catch (e) {} }
 function isAsciiPath(p) { return /^[\x00-\x7F]*$/.test(String(p)); }
+function stripSep(p) { return path.normalize(String(p).trim()).replace(/[\\/]+$/, ''); }
 function readJson(p) { return JSON.parse(fs.readFileSync(p, 'utf8')); }
 function mergeArguments(parent, child) {
   if (!parent && !child) return undefined;
   const p = parent || {}, c = child || {};
   return { game: (c.game || []).concat(p.game || []), jvm: (c.jvm || []).concat(p.jvm || []) };
 }
+// ---- Правила по ОС / разрядности (формат Mojang: rules[].os {name, arch, version}) ----
+const MOJANG_OS = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'osx' : 'linux';
+// Mojang: arch "x86" = 32-битная JVM/ОС; для arm64 Windows/Mac - "arm64"
+const MOJANG_ARCH = process.arch === 'ia32' ? 'x86' : process.arch === 'arm64' ? 'arm64' : 'x64';
+let _osRelease = null;
+function osVersion() {
+  if (_osRelease == null) { try { _osRelease = require('os').release(); } catch (e) { _osRelease = ''; } }
+  return _osRelease;
+}
+function osRuleMatches(o) {
+  if (!o) return true;
+  if (o.name && o.name !== MOJANG_OS && !(o.name === 'macos' && MOJANG_OS === 'osx')) return false;
+  if (o.arch) {
+    const a = String(o.arch).toLowerCase();
+    const want = a === 'x86' || a === 'i386' ? 'x86' : a === 'aarch64' || a === 'arm64' ? 'arm64' : a === 'x86_64' || a === 'amd64' ? 'x64' : a;
+    if (want !== MOJANG_ARCH) return false;
+  }
+  if (o.version) { try { if (!new RegExp(o.version).test(osVersion())) return false; } catch (e) {} }
+  return true;
+}
 function checkRules(rules, features) {
   if (!rules || !rules.length) return true;
   let allow = false;
   for (const r of rules) {
-    const osOk = !r.os || (r.os.name === 'windows' && process.platform === 'win32') || !r.os.name;
     const featOk = !r.features || Object.keys(r.features).every(k => !!(features && features[k]) === !!r.features[k]);
-    const match = (!r.os || osOk) && featOk;
+    const match = osRuleMatches(r.os) && featOk;
     if (r.action === 'allow') { if (match) allow = true; }
     else if (r.action === 'disallow') { if (match) allow = false; }
   }
   return allow;
+}
+// Библиотека нужна на этой машине: rules + нативы новых профилей (1.19+), где ОС/разрядность
+// закодированы в classifier имени: org.lwjgl:lwjgl:3.3.1:natives-windows-x86 / -arm64.
+function libAllowed(lib) {
+  if (!lib || !checkRules(lib.rules)) return false;
+  const cls = String(lib.name || '').split(':')[3] || '';
+  const m = cls.match(/^natives-(windows|macos|osx|linux)(?:-(x86|x86_64|arm64|aarch64|arm32))?$/i);
+  if (!m) return true;
+  const os = m[1].toLowerCase() === 'macos' ? 'osx' : m[1].toLowerCase();
+  if (os !== MOJANG_OS) return false;
+  const a = (m[2] || '').toLowerCase();
+  const arch = !a || a === 'x86_64' ? 'x64' : a === 'x86' ? 'x86' : a === 'arm32' ? 'arm32' : 'arm64';
+  return arch === MOJANG_ARCH;
 }
 function splitArgs(str) {
   const out = [];

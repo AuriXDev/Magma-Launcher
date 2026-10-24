@@ -1,5 +1,5 @@
 // Шаблон нового плагина
-// Показывает основные возможности API подробности — PLUGINS.md
+// Показывает основные возможности API подробности - PLUGINS.md
 function files(id, name) {
   const manifest = {
     id,
@@ -10,10 +10,10 @@ function files(id, name) {
     main: 'main.js',
     renderer: 'renderer.js',
     style: 'style.css',
-    minLauncher: '2.0.0'
+    minLauncher: '2.0.1'
   };
 
-  const main = `// main.js — выполняется в ГЛАВНОМ процессе Electron (Node.js, полный доступ к ФС, сети, процессу игры).
+  const main = `// main.js - выполняется в ГЛАВНОМ процессе Electron (Node.js, полный доступ к ФС, сети, процессу игры).
 // api: см. PLUGINS.md → «API главного процесса».
 module.exports = {
   activate(api) {
@@ -41,12 +41,12 @@ module.exports = {
   },
 
   deactivate() {
-    // Хуки, handle() и таймеры api снимаются автоматически. Здесь — закрыть свои ресурсы (сокеты, файлы…).
+    // Хуки, handle() и таймеры api снимаются автоматически. Здесь - закрыть свои ресурсы (сокеты, файлы…).
   }
 };
 `;
 
-  const renderer = `// renderer.js — выполняется в ОКНЕ лаунчера (DOM + Node.js через require).
+  const renderer = `// renderer.js - выполняется в ОКНЕ лаунчера (DOM + Node.js через require).
 // mgl: см. PLUGINS.md → «API интерфейса».
 module.exports = {
   activate(mgl) {
@@ -103,7 +103,7 @@ module.exports = {
     });
 
     // 5. События
-    mgl.on('game:launched', (d) => { if (mgl.storage.get('toastOnLaunch', true)) mgl.ui.toast('Плагин: игра запущена — ' + d.folder); });
+    mgl.on('game:launched', (d) => { if (mgl.storage.get('toastOnLaunch', true)) mgl.ui.toast('Плагин: игра запущена - ' + d.folder); });
   },
 
   deactivate() {
@@ -112,7 +112,7 @@ module.exports = {
 };
 `;
 
-  const style = `/* style.css плагина — подключается автоматически, удаляется при выключении. Цвета — через переменные темы. */
+  const style = `/* style.css плагина - подключается автоматически, удаляется при выключении. Цвета - через переменные темы. */
 .tpl-stats { font-size: 13px; line-height: 1.8; color: var(--text-dim); }
 .tpl-stats b { color: var(--accent); }
 `;
@@ -121,13 +121,13 @@ module.exports = {
 
 Плагин для Magma Launcher. Создан из шаблона.
 
-- \`plugin.json\` — манифест
-- \`main.js\` — код главного процесса (хуки запуска, файлы, сеть)
-- \`renderer.js\` — код интерфейса (вкладки, кнопки, настройки)
-- \`style.css\` — стили
+- \`plugin.json\` - манифест
+- \`main.js\` - код главного процесса (хуки запуска, файлы, сеть)
+- \`renderer.js\` - код интерфейса (вкладки, кнопки, настройки)
+- \`style.css\` - стили
 
-Документация: PLUGINS.md в папке лаунчера (кнопка «Как писать плагины» во вкладке «Плагины»).
-После правок нажмите ↻ у плагина — перезагрузка без перезапуска лаунчера.
+Документация: docs/PLUGINS.md на GitHub (кнопка «Как писать плагины» во вкладке «Плагины»).
+После правок нажмите ↻ у плагина - перезагрузка без перезапуска лаунчера.
 `;
 
   return {

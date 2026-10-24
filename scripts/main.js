@@ -7,9 +7,35 @@ const { spawn } = require('child_process');
 const MinecraftManager = require('./minecraft-manager');
 const LauncherSettings = require('./settings');
 const PluginHost = require('./plugin-host');
+const CrashReporter = require('./crash-reporter');
+const i18n = require('./i18n');
 
 let mainWindow = null;
 const settings = new LauncherSettings();
+
+// Язык интерфейса главного процесса (трей, системные диалоги, уведомления): settings.language = auto | ru | en
+const applyLanguage = () => i18n.use(settings.get('language'), app.getLocale());
+const trDialogOpts = (o) => (o && typeof o === 'object' ? {
+  ...o, title: o.title && i18n.t(o.title), message: o.message && i18n.t(o.message), buttonLabel: o.buttonLabel && i18n.t(o.buttonLabel),
+  filters: o.filters && o.filters.map(f => ({ ...f, name: i18n.t(f.name) }))
+} : o);
+['showOpenDialog', 'showSaveDialog'].forEach(m => {
+  if (typeof dialog[m] !== 'function') return;
+  const orig = dialog[m].bind(dialog);
+  dialog[m] = (win, opts) => (opts ? orig(win, trDialogOpts(opts)) : orig(trDialogOpts(win)));
+});
+
+// Локальные отчёты о сбоях (%APPDATA%/magma-launcher/crash-reports) - ничего не отправляется наружу
+const crashReporter = new CrashReporter({
+  dir: path.join(settings.dir, 'crash-reports'),
+  context: () => ({ launcherVersion: app.getVersion(), minecraftDir: minecraftDir(), enabled: settings.get('crashReports') !== false })
+});
+crashReporter.onReport((info) => sendRenderer('crash:new', info));
+process.on('uncaughtException', (err) => { console.error('[MGL2] uncaughtException', err); crashReporter.report('main', { error: err }); });
+process.on('unhandledRejection', (err) => { console.error('[MGL2] unhandledRejection', err); crashReporter.report('rejection', { error: err }); });
+app.on('child-process-gone', (e, d) => {
+  if (d && d.reason !== 'clean-exit') crashReporter.report('child-gone', { title: d.type, error: `Процесс «${d.type}» завершился: ${d.reason} (код ${d.exitCode})`, details: d });
+});
 
 function defaultMinecraftDir() {
   const appdata = process.env.APPDATA ||
@@ -31,6 +57,24 @@ const plugins = new PluginHost({
   sendRenderer: (ch, payload) => sendRenderer(ch, payload),
   launcherVersion: app.getVersion()
 });
+
+// Сборки (instances/<имя>) - scripts/instances.js
+const instances = require('./instances')({
+  ipcMain, shell, getManager: () => manager, minecraftDir: () => minecraftDir(), sendRenderer: (ch, d) => sendRenderer(ch, d),
+  httpsJson: (u) => httpsJson(u), downloadFile: (u, d, p) => downloadFile(u, d, p),
+  mlInstall: (...a) => mlInstall(...a), describeInstalled: () => describeInstalled(), detectLoaderVersion: (f, l) => detectLoaderVersion(f, l),
+  MinecraftManager, versionDirNames: () => versionDirNames(), removeNewVersionDirs: (b, m) => removeNewVersionDirs(b, m), versionDirMatcher: (mc) => versionDirMatcher(mc),
+  httpsPost: (u, b) => httpsPost(u, b), readLevelDat: (buf) => readLevelDat(buf)
+});
+
+// level.dat мира (gzip NBT) → название, режим, время последней игры
+function readLevelDat(buf) {
+  if (buf[0] === 0x1f && buf[1] === 0x8b) buf = zlib.gunzipSync(buf);
+  const root = readNbtRoot(buf);
+  const d = (root && root.Data) || {};
+  const lp = d.LastPlayed;
+  return { name: typeof d.LevelName === 'string' ? d.LevelName : '', gameType: typeof d.GameType === 'number' ? d.GameType : null, lastPlayed: lp != null ? Number(lp) : 0 };
+}
 
 function describeInstalled() {
   return manager.getInstalledVersions().map(folder => {
@@ -445,7 +489,7 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, '..', 'index.html'));
   mainWindow.once('ready-to-show', () => mainWindow.show());
   if (process.argv.includes('--dev')) mainWindow.webContents.openDevTools({ mode: 'detach' });
-  // Закрытие окна при фоновой работе (загрузки / свой сервер / игра) — сворачиваем в трей, а не выходим
+  // Закрытие окна при фоновой работе (загрузки / свой сервер / игра) - сворачиваем в трей, а не выходим
   mainWindow.on('close', (e) => {
     if (quittingApp) return;
     const busy = busyParts();
@@ -454,11 +498,16 @@ function createWindow() {
     hideToTray(busy);
   });
   mainWindow.on('closed', () => { mainWindow = null; });
+  // состояние «развёрнуто» - для кнопки в шапке (двойной клик по шапке разворачивает окно средствами ОС)
+  mainWindow.on('maximize', () => sendRenderer('window:state', { maximized: true }));
+  mainWindow.on('unmaximize', () => sendRenderer('window:state', { maximized: false }));
   // Падение/зависание окна, где работали плагины → плагин-система отключается, лог сохраняется, окно перезагружается
   mainWindow.webContents.on('render-process-gone', (e, details) => {
+    if (details && details.reason !== 'clean-exit') crashReporter.report('renderer-gone', { error: `Окно лаунчера аварийно завершилось: ${details.reason} (код ${details.exitCode})`, details });
     if (plugins.onRendererGone(details) && mainWindow && !mainWindow.isDestroyed()) setTimeout(() => mainWindow && mainWindow.reload(), 300);
   });
   mainWindow.on('unresponsive', () => {
+    crashReporter.report('unresponsive', { error: 'Окно лаунчера перестало отвечать' });
     if (!plugins.onRendererUnresponsive() || !mainWindow) return;
     try { mainWindow.webContents.forcefullyCrashRenderer(); } catch (e) {}
     setTimeout(() => mainWindow && !mainWindow.isDestroyed() && mainWindow.reload(), 500);
@@ -476,7 +525,7 @@ function busyParts() {
 function trayIcon() {
   const candidates = [
     process.resourcesPath ? path.join(process.resourcesPath, 'icon.ico') : null,   // установленная версия (вне asar)
-    path.join(__dirname, '..', 'assets', 'icon.ico'),
+    path.join(__dirname, '..', 'assets', 'icons', 'icon.ico'),
     path.join(__dirname, '..', 'assets', 'icons', 'icon.png')
   ].filter(Boolean);
   for (const p of candidates) {
@@ -498,12 +547,12 @@ function quitFully() { quittingApp = true; app.quit(); }
 function updateTray() {
   if (!tray) return;
   const busy = busyParts();
-  tray.setToolTip('Magma Launcher' + (busy.length ? ' — ' + busy.join(' · ') : ''));
+  tray.setToolTip('Magma Launcher' + (busy.length ? ' - ' + i18n.t(busy.join(' · ')) : ''));
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Открыть Magma Launcher', click: showFromTray },
-    { label: busy.length ? 'В работе: ' + busy.join(', ') : 'Задач нет', enabled: false },
+    { label: i18n.t('Открыть Magma Launcher'), click: showFromTray },
+    { label: busy.length ? i18n.t('В работе: ' + busy.join(', ')) : i18n.t('Задач нет'), enabled: false },
     { type: 'separator' },
-    { label: 'Выйти полностью', click: quitFully }
+    { label: i18n.t('Выйти полностью'), click: quitFully }
   ]));
 }
 function ensureTray() {
@@ -531,8 +580,8 @@ function hideToTray(busy) {
     trayHinted = true;
     try {
       tray.displayBalloon({
-        title: 'Magma Launcher работает в фоне',
-        content: `${busy.join(', ')}. Значок в трее - открыть лаунчер или выйти. После завершения задач лаунчер закроется сам.`
+        title: i18n.t('Magma Launcher работает в фоне'),
+        content: i18n.t(`${busy.join(', ')}. Значок в трее - открыть лаунчер или выйти. После завершения задач лаунчер закроется сам.`)
       });
     } catch (e) {}
   }
@@ -556,8 +605,32 @@ function setupDisplayMedia() {
   } catch (e) { console.warn('[MGL2] setDisplayMediaRequestHandler', e.message); }
 }
 
+// «Что делать с окном лаунчера, когда игра запущена» (settings.windowOnLaunch: keep | minimize | tray).
+// Пока игра идёт, окно свёрнуто/скрыто; когда закрылась последняя игра - возвращаем его на место.
+let windowAction = null;   // 'minimized' | 'hidden' - что сделали мы сами
+function applyWindowOnLaunch() {
+  const mode = settings.get('windowOnLaunch') || 'keep';
+  if (!mainWindow || mainWindow.isDestroyed() || mode === 'keep') return;
+  if (mode === 'minimize') {
+    if (mainWindow.isMinimized() || !mainWindow.isVisible()) return;
+    mainWindow.minimize(); windowAction = 'minimized';
+  } else if (mode === 'tray') {
+    if (!mainWindow.isVisible()) return;
+    mainWindow.hide(); ensureTray(); windowAction = 'hidden';
+  }
+}
+function restoreWindowAfterGame() {
+  if (!windowAction || manager.getRunning().length) return;
+  const was = windowAction;
+  windowAction = null;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (was === 'hidden') { if (!mainWindow.isVisible()) showFromTray(); else destroyTray(); }
+  else if (mainWindow.isMinimized()) { mainWindow.restore(); mainWindow.show(); mainWindow.focus(); }
+}
+
 ipcMain.on('minimize-window', () => mainWindow && mainWindow.minimize());
 ipcMain.on('maximize-window', () => { if (mainWindow) mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize(); });
+ipcMain.handle('window:isMaximized', () => !!(mainWindow && mainWindow.isMaximized()));
 ipcMain.on('close-window', () => mainWindow && mainWindow.close());
 ipcMain.on('focus-window', () => {
   if (!mainWindow) return;
@@ -721,7 +794,7 @@ async function startManagedServer(id) {
   if (!entry) return { ok: false, error: 'Сервер не найден' };
   if (serverProcs.has(id)) return { ok: false, error: 'Сервер уже запущен' };
   const dir = managedDir(id);
-  if (!fs.existsSync(path.join(dir, 'server.jar'))) return { ok: false, error: 'Нет server.jar — пересоздайте сервер' };
+  if (!fs.existsSync(path.join(dir, 'server.jar'))) return { ok: false, error: 'Нет server.jar - пересоздайте сервер' };
   const proc = { child: null, state: 'starting', startedAt: Date.now(), stopping: false, restart: false, killTimer: null };
   serverProcs.set(id, proc);
   srvState(id, 'starting');
@@ -730,7 +803,7 @@ async function startManagedServer(id) {
     srvLog(id, `Подготовка Java ${major}…`, 'system');
     let java = entry.javaPath && fs.existsSync(entry.javaPath) ? entry.javaPath : manager.resolveLaunchJava(major, null);
     if (!java) {
-      srvLog(id, `Java ${major} не найдена — загрузка…`, 'system');
+      srvLog(id, `Java ${major} не найдена - загрузка…`, 'system');
       java = await manager.ensureJava(major, (p, s) => sendRenderer('java:installProgress', { major, progress: p, status: s }));
     }
     if (!java) throw new Error('Не удалось получить Java ' + major);
@@ -796,7 +869,7 @@ function stopManagedServer(id, { restart = false, force = false } = {}) {
   srvState(id, 'stopping');
   try { p.child.stdin.write('stop\n'); } catch (e) {}
   clearTimeout(p.killTimer);
-  p.killTimer = setTimeout(() => { srvLog(id, 'Сервер не остановился за 30 с — принудительное завершение', 'system'); try { p.child.kill(); } catch (e) {} }, 30000);
+  p.killTimer = setTimeout(() => { srvLog(id, 'Сервер не остановился за 30 с - принудительное завершение', 'system'); try { p.child.kill(); } catch (e) {} }, 30000);
   return { ok: true };
 }
 ipcMain.handle('srv:start', (e, id) => startManagedServer(id));
@@ -898,6 +971,25 @@ function netBuffer(url) {
     req.end();
   });
 }
+function httpsPost(url, body) {
+  return new Promise((resolve, reject) => {
+    const req = net.request({ url, method: 'POST', redirect: 'follow', useSessionCookies: false });
+    req.setHeader('User-Agent', 'MGL2/0.1');
+    req.setHeader('Content-Type', 'application/json');
+    req.on('response', res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(Buffer.from(c)));
+      res.on('end', () => {
+        if (res.statusCode >= 300) return reject(new Error('HTTP ' + res.statusCode + ' ' + url));
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (e) { reject(e); }
+      });
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.write(JSON.stringify(body));
+    req.end();
+  });
+}
 async function httpsJson(url) {
   let lastErr;
   for (let i = 0; i < 3; i++) {
@@ -971,6 +1063,21 @@ ipcMain.handle('skin:fetch', async (e, { mode, value } = {}) => {
 // ---------- Обновление лаунчера (GitHub Releases) ----------
 const UPDATE_REPO = 'AuriXDev/Magma-Launcher';
 ipcMain.handle('app:version', () => app.getVersion());
+// Последний релиз на GitHub (для проверки на сплеше). version - тег без «v».
+ipcMain.handle('update:check', async (e, params) => {
+  const p = params || {};
+  const repo = /^[\w.-]+\/[\w.-]+$/.test(p.repo || '') ? p.repo : UPDATE_REPO;
+  try {
+    const rel = await Promise.race([
+      httpsJson(`https://api.github.com/repos/${repo}/releases/latest`),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000))
+    ]);
+    const assets = (rel && rel.assets) || [];
+    const hasExe = assets.some(a => /\.exe$/i.test(a.name));
+    const tag = String((rel && rel.tag_name) || '').trim();
+    return { ok: !!tag, version: tag.replace(/^v/i, ''), tag, hasExe, packaged: app.isPackaged };
+  } catch (err) { return { ok: false, error: err.message, packaged: app.isPackaged }; }
+});
 ipcMain.handle('update:download', async (e, params) => {
   const p = params || {};
   const repo = /^[\w.-]+\/[\w.-]+$/.test(p.repo || '') ? p.repo : UPDATE_REPO;
@@ -996,7 +1103,7 @@ ipcMain.handle('update:download', async (e, params) => {
 });
 
 const { pathToFileURL } = require('url');
-function bgDir(kind) { return path.join(minecraftDir(), 'mgl', 'data', kind === 'obj' ? 'obj' : 'pictures'); }
+function bgDir(kind) { return path.join(minecraftDir(), 'mgl', 'data', kind === 'obj' ? 'obj' : kind === 'videos' ? 'videos' : 'pictures'); }
 function bgReadHistory(kind) {
   try { return JSON.parse(fs.readFileSync(path.join(bgDir(kind), 'history.json'), 'utf8')) || []; } catch (e) { return []; }
 }
@@ -1118,10 +1225,16 @@ ipcMain.handle('dialog:pickFile', async (e, params) => {
   const r = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'], filters: (params && params.filters) || [] });
   return r.canceled ? null : r.filePaths[0];
 });
+ipcMain.handle('dialog:saveFile', async (e, params) => {
+  const r = await dialog.showSaveDialog(mainWindow, { title: (params && params.title) || 'Сохранить', defaultPath: params && params.defaultPath, filters: (params && params.filters) || [] });
+  return r.canceled || !r.filePath ? null : r.filePath;
+});
 
 const MODRINTH_API = 'https://api.modrinth.com/v2';
-function contentDirFor(projectType) {
-  const base = minecraftDir();
+// root - папка сборки (instances/<id>) или null = общая .minecraft
+function contentRoot(p) { return p && p.instance ? instances.dirOf(p.instance) : null; }
+function contentDirFor(projectType, root) {
+  const base = root || minecraftDir();
   if (projectType === 'resourcepack') return path.join(base, 'resourcepacks');
   if (projectType === 'shader') return path.join(base, 'shaderpacks');
   return path.join(base, 'mods');
@@ -1134,7 +1247,7 @@ ipcMain.handle('modrinth:search', async (e, params) => {
     const projectType = p.projectType || 'mod';
     const facets = [[`project_type:${projectType}`]];
     if (p.gameVersion) facets.push([`versions:${p.gameVersion}`]);
-    // Лоадер (forge/fabric…) — только для модов и модпаков; у шейдеров/ресурспаков другие категории
+    // Лоадер (forge/fabric…) - только для модов и модпаков; у шейдеров/ресурспаков другие категории
     if (p.loader && (projectType === 'mod' || projectType === 'modpack')) facets.push([`categories:${p.loader}`]);
     const limit = Math.max(1, Math.min(50, p.limit || 20));
     const offset = Math.max(0, p.offset || 0);
@@ -1165,16 +1278,49 @@ ipcMain.handle('modrinth:versions', async (e, params) => {
   }
 });
 
-function contentIndexFile() { return path.join(minecraftDir(), 'mgl', 'data', 'content-index.json'); }
-function readContentIndex() {
-  try { return JSON.parse(fs.readFileSync(contentIndexFile(), 'utf8')) || {}; } catch (e) { return {}; }
+function contentIndexFile(root) { return root ? path.join(root, '.mgl', 'content-index.json') : path.join(minecraftDir(), 'mgl', 'data', 'content-index.json'); }
+function readContentIndex(root) {
+  try { return JSON.parse(fs.readFileSync(contentIndexFile(root), 'utf8')) || {}; } catch (e) { return {}; }
 }
-function writeContentIndex(idx) {
+function writeContentIndex(idx, root) {
   try {
-    fs.mkdirSync(path.dirname(contentIndexFile()), { recursive: true });
-    fs.writeFileSync(contentIndexFile(), JSON.stringify(idx, null, 2));
+    fs.mkdirSync(path.dirname(contentIndexFile(root)), { recursive: true });
+    fs.writeFileSync(contentIndexFile(root), JSON.stringify(idx, null, 2));
   } catch (e) { console.warn('[MGL2] content-index', e.message); }
 }
+// project_id обязательных зависимостей версии (для предупреждения при удалении мода, от которого что-то зависит)
+function requiredProjects(v) {
+  return Array.from(new Set(((v && v.dependencies) || []).filter(d => d.dependency_type === 'required' && d.project_id).map(d => d.project_id)));
+}
+// Кто из установленных (включённых) модов требует этот. Старые записи индекса без `requires` дотягиваются одним запросом к Modrinth.
+ipcMain.handle('modrinth:dependents', async (e, params) => {
+  try {
+    const p = params || {};
+    if ((p.projectType || 'mod') !== 'mod') return { ok: true, dependents: [] };
+    const root = contentRoot(p);
+    const dir = contentDirFor('mod', root);
+    const idx = readContentIndex(root);
+    const key = String(p.filename || '').replace(/\.disabled$/i, '');
+    const me = idx[key];
+    if (!me || !me.project_id) return { ok: true, dependents: [], known: false };
+    const live = (fn) => fs.existsSync(path.join(dir, fn));
+    const need = Object.entries(idx).filter(([fn, m]) => m && m.version_id && !Array.isArray(m.requires) && live(fn));
+    if (need.length) {
+      try {
+        const ids = Array.from(new Set(need.map(([, m]) => m.version_id))).slice(0, 200);
+        const list = await httpsJson(`${MODRINTH_API}/versions?ids=${encodeURIComponent(JSON.stringify(ids))}`);
+        const byId = new Map((list || []).map(v => [v.id, v]));
+        need.forEach(([fn, m]) => { const v = byId.get(m.version_id); if (v) idx[fn] = { ...m, requires: requiredProjects(v) }; });
+        writeContentIndex(idx, root);
+      } catch (err) { /* нет связи - используем то, что уже знаем */ }
+    }
+    const dependents = Object.entries(idx)
+      .filter(([fn, m]) => fn !== key && m && Array.isArray(m.requires) && m.requires.includes(me.project_id) && live(fn))
+      .map(([fn, m]) => ({ filename: fn, title: m.title || fn }));
+    return { ok: true, dependents, known: true };
+  } catch (err) { return { ok: false, error: err.message, dependents: [] }; }
+});
+
 function findInstalledProject(idx, projectId, dir) {
   for (const [fn, m] of Object.entries(idx)) {
     if (m.project_id !== projectId) continue;
@@ -1194,9 +1340,10 @@ ipcMain.handle('modrinth:install', async (e, params) => {
     if (projectType === 'modpack') {
       return { ok: false, error: 'Установка .mrpack пока не поддерживается - откройте страницу проекта' };
     }
-    const dir = contentDirFor(projectType);
+    const root = contentRoot(p);
+    const dir = contentDirFor(projectType, root);
     try { fs.mkdirSync(dir, { recursive: true }); } catch (err) {}
-    const idx = readContentIndex();
+    const idx = readContentIndex(root);
     const withDeps = projectType === 'mod';
     const loaders = p.loader && projectType === 'mod' ? (p.loader === 'quilt' ? ['quilt', 'fabric'] : [p.loader]) : null;
     const result = { deps: [], skipped: [], warnings: [] };
@@ -1247,7 +1394,9 @@ ipcMain.handle('modrinth:install', async (e, params) => {
           try { fs.unlinkSync(existing.path); } catch (err) {}
           delete idx[existing.filename];
         }
-        idx[safeName] = { project_id: projectId, version_id: v.id, slug, title, type: projectType, ts: Date.now() };
+        idx[safeName] = { project_id: projectId, version_id: v.id, slug, title, type: projectType, ts: Date.now(),
+          version_number: v.version_number || '', game_versions: v.game_versions || [], loaders: v.loaders || [],
+          requires: requiredProjects(v) };
         if (ctx.isRoot) { result.filename = safeName; result.file = dest; result.versionId = v.id; result.title = title; }
         else result.deps.push({ title, filename: safeName });
       }
@@ -1277,9 +1426,9 @@ ipcMain.handle('modrinth:install', async (e, params) => {
       return v;
     };
 
-    const root = await installOne(p.slug, { isRoot: true, depth: 0, versionId: p.versionId });
-    writeContentIndex(idx);
-    if (!root) throw new Error('Версия не найдена');
+    const rootVer = await installOne(p.slug, { isRoot: true, depth: 0, versionId: p.versionId });
+    writeContentIndex(idx, root);
+    if (!rootVer) throw new Error('Версия не найдена');
     return { ok: true, projectType, ...result };
   } catch (err) {
     sendRenderer('modrinth:installProgress', { slug: progressSlug, progress: 0, status: 'Ошибка: ' + err.message });
@@ -1287,32 +1436,59 @@ ipcMain.handle('modrinth:install', async (e, params) => {
   }
 });
 
-ipcMain.handle('modrinth:listInstalled', (e, projectType) => {
+ipcMain.handle('modrinth:listInstalled', (e, arg) => {
   try {
-    const dir = contentDirFor(projectType || 'mod');
+    const p = typeof arg === 'object' && arg ? arg : { projectType: arg };
+    const dir = contentDirFor(p.projectType || 'mod', contentRoot(p));
+    const idx = readContentIndex(contentRoot(p));
     if (!fs.existsSync(dir)) return [];
     return fs.readdirSync(dir)
       .filter(n => /\.(jar|zip)(\.disabled)?$/i.test(n))
       .map(n => {
         const st = fs.statSync(path.join(dir, n));
-        return { filename: n, size: st.size, mtime: st.mtimeMs, added: st.birthtimeMs || st.mtimeMs };
+        const meta = idx[n.replace(/\.disabled$/i, '')] || null;
+        return { filename: n, size: st.size, mtime: st.mtimeMs, added: st.birthtimeMs || st.mtimeMs, title: meta && meta.title, slug: meta && meta.slug, projectId: meta && meta.project_id,
+          versionNumber: meta && meta.version_number, gameVersions: meta && meta.game_versions, loaders: meta && meta.loaders };
       });
   } catch (err) { return []; }
+});
+
+// Старые записи индекса (до хранения версий) - дотянуть game_versions/loaders одним запросом /versions?ids=[…]
+ipcMain.handle('modrinth:backfill', async (e, params) => {
+  try {
+    const root = contentRoot(params || {});
+    const idx = readContentIndex(root);
+    const need = Object.entries(idx).filter(([, m]) => m && m.version_id && !Array.isArray(m.game_versions));
+    if (!need.length) return { ok: true, updated: 0 };
+    const ids = Array.from(new Set(need.map(([, m]) => m.version_id))).slice(0, 200);
+    const list = await httpsJson(`${MODRINTH_API}/versions?ids=${encodeURIComponent(JSON.stringify(ids))}`);
+    const byId = new Map((list || []).map(v => [v.id, v]));
+    let updated = 0;
+    need.forEach(([fn, m]) => {
+      const v = byId.get(m.version_id);
+      if (!v) return;
+      idx[fn] = { ...m, version_number: v.version_number || '', game_versions: v.game_versions || [], loaders: v.loaders || [] };
+      updated++;
+    });
+    if (updated) writeContentIndex(idx, root);
+    return { ok: true, updated };
+  } catch (err) { return { ok: false, error: err.message }; }
 });
 
 ipcMain.handle('modrinth:remove', (e, params) => {
   try {
     const p = params || {};
-    const dir = contentDirFor(p.projectType || 'mod');
+    const root = contentRoot(p);
+    const dir = contentDirFor(p.projectType || 'mod', root);
     const abs = path.resolve(path.join(dir, p.filename || ''));
     if (!abs.startsWith(path.resolve(dir) + path.sep)) return { ok: false, error: 'Недопустимый путь' };
-    if (/^MGLskin/i.test(path.basename(abs))) return { ok: false, error: 'Моды MGL S&C управляются лаунчером — отключите «Использовать MGL S&C» в настройках' };
+    if (/^MGLskin/i.test(path.basename(abs))) return { ok: false, error: 'Моды MGL S&C управляются лаунчером - отключите «Использовать MGL S&C» в настройках' };
     if (!fs.existsSync(abs)) return { ok: false, error: 'Файл не найден' };
     fs.unlinkSync(abs);
     try {
-      const idx = readContentIndex();
+      const idx = readContentIndex(root);
       const key = path.basename(abs).replace(/\.disabled$/i, '');
-      if (idx[key]) { delete idx[key]; writeContentIndex(idx); }
+      if (idx[key]) { delete idx[key]; writeContentIndex(idx, root); }
     } catch (e2) {}
     return { ok: true };
   } catch (err) { return { ok: false, error: err.message }; }
@@ -1320,7 +1496,7 @@ ipcMain.handle('modrinth:remove', (e, params) => {
 
 ipcMain.handle('modrinth:importFiles', (e, params) => {
   const p = params || {};
-  const dir = contentDirFor(p.projectType || 'mod');
+  const dir = contentDirFor(p.projectType || 'mod', contentRoot(p));
   const added = [], skipped = [];
   try { fs.mkdirSync(dir, { recursive: true }); } catch (err) {}
   (p.paths || []).forEach(src => {
@@ -1340,18 +1516,20 @@ ipcMain.handle('modrinth:importFiles', (e, params) => {
 
 ipcMain.handle('modrinth:toggleAll', (e, params) => {
   const p = params || {};
-  const dir = contentDirFor(p.projectType || 'mod');
+  const dir = contentDirFor(p.projectType || 'mod', contentRoot(p));
   let changed = 0, failed = 0;
   try {
     fs.readdirSync(dir).forEach(n => {
       if (/^MGLskin/i.test(n)) return;
       const off = /\.(jar|zip)\.disabled$/i.test(n);
       const on = /\.(jar|zip)$/i.test(n);
-      if (p.enable && off) {
-        try { fs.renameSync(path.join(dir, n), path.join(dir, n.replace(/\.disabled$/i, ''))); changed++; } catch (err) { failed++; }
-      } else if (!p.enable && on) {
-        try { fs.renameSync(path.join(dir, n), path.join(dir, n + '.disabled')); changed++; } catch (err) { failed++; }
-      }
+      // renameSync в Windows молча заменяет существующий файл - если копия с таким именем уже есть, не трогаем
+      const move = (to) => {
+        if (fs.existsSync(path.join(dir, to))) { failed++; return; }
+        try { fs.renameSync(path.join(dir, n), path.join(dir, to)); changed++; } catch (err) { failed++; }
+      };
+      if (p.enable && off) move(n.replace(/\.disabled$/i, ''));
+      else if (!p.enable && on) move(n + '.disabled');
     });
     return { ok: true, changed, failed };
   } catch (err) { return { ok: false, error: err.message }; }
@@ -1360,7 +1538,7 @@ ipcMain.handle('modrinth:toggleAll', (e, params) => {
 ipcMain.handle('modrinth:toggle', (e, params) => {
   try {
     const p = params || {};
-    const dir = contentDirFor(p.projectType || 'mod');
+    const dir = contentDirFor(p.projectType || 'mod', contentRoot(p));
     const filename = p.filename || '';
     const abs = path.resolve(path.join(dir, filename));
     if (!abs.startsWith(path.resolve(dir) + path.sep)) return { ok: false, error: 'Недопустимый путь' };
@@ -1370,6 +1548,7 @@ ipcMain.handle('modrinth:toggle', (e, params) => {
     const newName = isDisabled ? filename.replace(/\.disabled$/i, '') : filename + '.disabled';
     const newAbs = path.resolve(path.join(dir, newName));
     if (!newAbs.startsWith(path.resolve(dir) + path.sep)) return { ok: false, error: 'Недопустимый путь' };
+    if (fs.existsSync(newAbs)) return { ok: false, error: `Уже есть файл «${newName}» - удалите лишнюю копию` };
     fs.renameSync(abs, newAbs);
     return { ok: true, filename: newName, enabled: isDisabled };
   } catch (err) { return { ok: false, error: err.message }; }
@@ -1388,13 +1567,41 @@ ipcMain.handle('mc:getAllVersions', async () => {
   }
 });
 ipcMain.handle('mc:isInstalled', (e, id) => manager.isVersionInstalled(id));
+// ---------- Отмена установок ----------
+// Ключ задачи = id в трее загрузок UI: mc:<версия>, ml:<loader>:<mc>, re:<папка>.
+ipcMain.handle('install:cancel', (e, key) => ({ ok: manager.cancelJob(String(key || '')) }));
+ipcMain.handle('install:active', () => manager.activeJobs());
+function versionDirNames() { try { return fs.readdirSync(path.join(minecraftDir(), 'versions')); } catch (e) { return []; } }
+// После отмены - убрать недокачанные папки версий, появившиеся за время установки (только подходящие под фильтр)
+function removeNewVersionDirs(before, match) {
+  const base = path.resolve(path.join(minecraftDir(), 'versions'));
+  versionDirNames().filter(d => !before.includes(d) && match(d)).forEach(d => {
+    const abs = path.resolve(base, d);
+    if (abs.startsWith(base + path.sep)) { try { fs.rmSync(abs, { recursive: true, force: true }); } catch (err) {} }
+  });
+}
+// Фильтр для removeNewVersionDirs по версии MC: «1.20» не должна цеплять «1.20.1» / «[1.20.1] fabric-…».
+// Если ту же версию сейчас ставит другая задача - ничего не трогаем, папки могут быть её.
+function versionDirMatcher(mc) {
+  const v = String(mc || '');
+  if (!v) return () => false;
+  const busy = manager.activeJobs().some(k => k === 'mc:' + v || k.endsWith(':' + v) || k.startsWith('inst:'));
+  if (busy) return () => false;
+  const re = new RegExp('(^|[^\\w.])' + v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^\\w.])');
+  return (d) => re.test(d);
+}
+
 ipcMain.handle('mc:installVersion', async (e, id) => {
+  const before = versionDirNames();
   try {
-    await manager.installVanilla(id, (progress, status) => sendRenderer('mc:installProgress', { id, progress, status }));
+    await manager.runCancellable('mc:' + id, () =>
+      manager.installVanilla(id, (progress, status) => sendRenderer('mc:installProgress', { id, progress, status })));
     return { ok: true };
   } catch (err) {
+    const cancelled = MinecraftManager.isCancelled(err);
+    if (cancelled) removeNewVersionDirs(before, d => d === id);
     sendRenderer('mc:installProgress', { id, progress: 0, status: 'Ошибка: ' + err.message });
-    return { ok: false, error: err.message };
+    return { ok: false, error: err.message, cancelled };
   }
 });
 ipcMain.handle('mc:getModloaders', (e, v) => manager.getAvailableModLoaders(v));
@@ -1432,8 +1639,8 @@ function mglBundled() {
     return fs.readdirSync(MGL_SC_DIR).map(f => { const m = f.match(MGL_NAME_RE); return m ? { file: f, loader: m[1].toLowerCase(), mc: m[2], src: path.join(MGL_SC_DIR, f) } : null; }).filter(Boolean);
   } catch (e) { return []; }
 }
-function mglEnsureCopies() {
-  const dir = contentDirFor('mod');
+function mglEnsureCopies(modsDir) {
+  const dir = modsDir || contentDirFor('mod');
   let copied = 0;
   try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
   mglBundled().forEach(a => {
@@ -1459,10 +1666,10 @@ function mglRemoveAll() {
   });
   return { removed, failed };
 }
-function mglApplyForLaunch(folder) {
+function mglApplyForLaunch(folder, modsDir) {
   const info = instanceInfo(folder);
-  mglEnsureCopies();
-  const dir = contentDirFor('mod');
+  mglEnsureCopies(modsDir);
+  const dir = modsDir || contentDirFor('mod');
   const list = mglBundled();
   let wanted = null;
   if (info.loader !== 'vanilla') {
@@ -1487,7 +1694,7 @@ function mglApplyForLaunch(folder) {
   return {
     ok: false,
     message: info.loader === 'vanilla'
-      ? 'MGL S&C: на Vanilla не работает — нужен Forge или Fabric. Игра запущена без мода.'
+      ? 'MGL S&C: на Vanilla не работает - нужен Forge или Fabric. Игра запущена без мода.'
       : `MGL S&C: нет мода под ${names[info.loader] || info.loader} ${info.mc || ''}. Игра запущена без него. Доступно: ${have || 'ничего'}.`
   };
 }
@@ -1514,7 +1721,7 @@ ipcMain.handle('mc:reinstall', async (e, folder) => {
   const info = instanceInfo(folder);
   if (!info || !info.mc) return { ok: false, error: 'Не удалось определить версию' };
   const loaderVersion = info.loader === 'vanilla' ? null : detectLoaderVersion(folder, info.loader);
-  if (info.loader !== 'vanilla' && !loaderVersion) return { ok: false, error: 'Не удалось определить версию загрузчика — удалите сборку и установите заново' };
+  if (info.loader !== 'vanilla' && !loaderVersion) return { ok: false, error: 'Не удалось определить версию загрузчика - удалите сборку и установите заново' };
   const bak = dir + '.reinstall-bak';
   try {
     send(1, 'Очистка сборки…');
@@ -1522,33 +1729,36 @@ ipcMain.handle('mc:reinstall', async (e, folder) => {
     fs.renameSync(dir, bak);
     const before = manager.getInstalledVersions();
     const sub =(a, b) => (p, s) => send(a + Math.floor(p * (b - a) / 100), s);
-    if (info.loader === 'vanilla') await manager.installVanilla(info.mc || folder, sub(2, 98));
-    else if (info.loader === 'fabric') await manager.installFabric(info.mc, loaderVersion, sub(2, 98));
-    else if (info.loader === 'quilt') await manager.installQuilt(info.mc, loaderVersion, sub(2, 98));
-    else {
-      let javaPath = settings.get('javaPath');
-      if (!javaPath || !fs.existsSync(javaPath)) javaPath = manager.resolveJava(null, javaPath);
-      if (!javaPath) javaPath = await manager.ensureJava(17, (p, s) => send(5 + Math.floor(p * 0.2), s));
-      if (info.loader === 'forge') await manager.installForge(info.mc, loaderVersion, javaPath, sub(2, 98));
-      else await manager.installNeoForge(info.mc, loaderVersion, javaPath, sub(2, 98));
-    }
+    await manager.runCancellable('re:' + folder, async () => {
+      if (info.loader === 'vanilla') await manager.installVanilla(info.mc || folder, sub(2, 98));
+      else if (info.loader === 'fabric') await manager.installFabric(info.mc, loaderVersion, sub(2, 98));
+      else if (info.loader === 'quilt') await manager.installQuilt(info.mc, loaderVersion, sub(2, 98));
+      else {
+        let javaPath = settings.get('javaPath');
+        if (!javaPath || !fs.existsSync(javaPath)) javaPath = manager.resolveJava(null, javaPath);
+        if (!javaPath) javaPath = await manager.ensureJava(17, (p, s) => send(5 + Math.floor(p * 0.2), s));
+        if (info.loader === 'forge') await manager.installForge(info.mc, loaderVersion, javaPath, sub(2, 98));
+        else await manager.installNeoForge(info.mc, loaderVersion, javaPath, sub(2, 98));
+      }
+    });
     if (!manager.isVersionInstalled(folder)) {
       const created = describeInstalled().filter(x => !before.includes(x.folder) && x.loader === info.loader);
       if (info.loader !== 'vanilla' && created.length === 1) manager.renameVersion(created[0].folder, folder);
     }
-    if (!manager.isVersionInstalled(folder)) throw new Error('Установщик создал сборку с другим именем папки — старая сохранена как «' + path.basename(bak) + '»');
+    if (!manager.isVersionInstalled(folder)) throw new Error('Установщик создал сборку с другим именем папки - старая сохранена как «' + path.basename(bak) + '»');
     fs.rmSync(bak, { recursive: true, force: true });
     send(100, 'Готово');
     return { ok: true };
   } catch (err) {
     try {
-      if (fs.existsSync(bak) && !fs.existsSync(path.join(dir, `${folder}.json`))) {
+      // при отмене откатываем всегда: json уже записан, но библиотеки/ассеты недокачаны
+      if (fs.existsSync(bak) && (MinecraftManager.isCancelled(err) || !fs.existsSync(path.join(dir, `${folder}.json`)))) {
         if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
         fs.renameSync(bak, dir);
       }
     } catch (e2) { console.warn('[MGL2] reinstall rollback', e2.message); }
     send(0, 'Ошибка: ' + err.message);
-    return { ok: false, error: err.message };
+    return { ok: false, error: err.message, cancelled: MinecraftManager.isCancelled(err) };
   }
 });
 
@@ -1568,7 +1778,20 @@ ipcMain.handle('ml:getLoaderVersions', async (e, { loader, mcVersion }) => {
 
 ipcMain.handle('ml:install', async (e, { loader, mcVersion, loaderVersion }) => {
   const send = (progress, status) => sendRenderer('ml:installProgress', { loader, mcVersion, progress, status });
+  const beforeDirs = versionDirNames();
   try {
+    return await manager.runCancellable(`ml:${loader}:${mcVersion}`, () => mlInstall(loader, mcVersion, loaderVersion, send));
+  } catch (err) {
+    const cancelled = MinecraftManager.isCancelled(err);
+    // папки, созданные этой установкой (загрузчик и недокачанный vanilla-родитель, если его не было)
+    if (cancelled) removeNewVersionDirs(beforeDirs, versionDirMatcher(mcVersion));
+    if (err && err.code === 'JAVA_MISSING') sendRenderer('java:missing', { major: err.major, loader });
+    send(0, 'Ошибка: ' + err.message);
+    return { ok: false, error: err.message, cancelled };
+  }
+});
+async function mlInstall(loader, mcVersion, loaderVersion, send) {
+  {
     let res;
     if (loader === 'fabric') res = await manager.installFabric(mcVersion, loaderVersion, send);
     else if (loader === 'quilt') res = await manager.installQuilt(mcVersion, loaderVersion, send);
@@ -1593,12 +1816,8 @@ ipcMain.handle('ml:install', async (e, { loader, mcVersion, loaderVersion }) => 
       throw new Error('Неизвестный лоадер: ' + loader);
     }
     return { ok: true, ...res };
-  } catch (err) {
-    if (err && err.code === 'JAVA_MISSING') sendRenderer('java:missing', { major: err.major, loader });
-    send(0, 'Ошибка: ' + err.message);
-    return { ok: false, error: err.message };
   }
-});
+}
 
 // ---------- Java ----------
 ipcMain.handle('java:ensure', async (e, major) => {
@@ -1614,9 +1833,10 @@ ipcMain.handle('java:ensure', async (e, major) => {
 
 ipcMain.handle('java:scan', () => {
   try {
-    const list = manager.scanSystemJavas().map(j => ({ path: j.javaw, home: j.home, major: j.major, vendor: j.vendor }));
+    const all = manager.scanSystemJavas();
+    const list = all.map(j => ({ path: j.javaw, home: j.home, major: j.major, vendor: j.vendor }));
     const pick = {};
-    [8, 17, 21, 25].forEach(m => { pick[m] = manager.findSystemJava(m); });
+    [8, 17, 21, 25].forEach(m => { pick[m] = manager.findSystemJava(m, all); });
     return { ok: true, list, pick };
   } catch (err) { return { ok: false, error: err.message, list: [], pick: {} }; }
 });
@@ -1638,7 +1858,7 @@ ipcMain.handle('java:installAdoptium', async (e, major) => {
     await downloadFile(url, dest, (done, total) => {
       if (total) send(1 + Math.floor(done / total * 97), `Temurin ${major}: ${(done / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} МБ`);
     });
-    if (fs.statSync(dest).size < 5 * 1048576) throw new Error('Скачанный установщик повреждён — повторите попытку');
+    if (fs.statSync(dest).size < 5 * 1048576) throw new Error('Скачанный установщик повреждён - повторите попытку');
     send(100, `Установщик Temurin ${major} скачан`);
     const err = await shell.openPath(dest);
     if (err) throw new Error('Не удалось открыть установщик: ' + err);
@@ -1713,7 +1933,11 @@ ipcMain.handle('settings:import', async () => {
   } catch (err) { return { ok: false, error: err.message }; }
 });
 ipcMain.handle('settings:get', () => settings.getAll());
-ipcMain.handle('settings:save', (e, patch) => { settings.update(patch || {}); settings.save(); return settings.getAll(); });
+ipcMain.handle('settings:save', (e, patch) => {
+  settings.update(patch || {}); settings.save();
+  if (patch && 'language' in patch) { applyLanguage(); updateTray(); }
+  return settings.getAll();
+});
 
 
 
@@ -1723,8 +1947,11 @@ ipcMain.handle('settings:save', (e, patch) => { settings.update(patch || {}); se
 function sendRenderer(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
 }
-function applyActiveSkinCape(username) {
+// gameDir - папка игры запуска (сборка или .minecraft): туда кладутся CustomSkinLoader/ и mgl/active.properties;
+// сама библиотека скинов всегда общая - <.minecraft>/mgl/skin|cape
+function applyActiveSkinCape(username, gameDir) {
   const base = path.join(minecraftDir(), 'mgl');
+  const gd = gameDir || minecraftDir();
   const applied = { skin: null, cape: null };
   const safeUser = (username || 'Player').replace(/[^a-zA-Z0-9_\-]/g, '_') || 'Player';
   for (const kind of ['skin', 'cape']) {
@@ -1733,25 +1960,34 @@ function applyActiveSkinCape(username) {
       if (!fs.existsSync(dir)) continue;
       const meta = path.join(dir, '_active.json');
       const activeFile = fs.existsSync(meta) ? (JSON.parse(fs.readFileSync(meta, 'utf8')).active || null) : null;
-
-      for (const stale of ['active.png', safeUser + '.png']) {
-        const p = path.join(dir, stale);
-        if (!fs.existsSync(p)) continue;
-        if (activeFile === stale) continue;
-        try { fs.unlinkSync(p); } catch (e) {}
-      }
-
+      // Файлы библиотеки здесь НЕ удаляем: раньше стирался «<ник>.png» - скин, добавленный по своему нику, пропадал.
       if (!activeFile) continue;
       const src = path.join(dir, activeFile);
       if (!fs.existsSync(src)) continue;
       const buf = fs.readFileSync(src);
-      const cslDir = path.join(minecraftDir(), 'CustomSkinLoader', 'LocalSkin', kind === 'cape' ? 'capes' : 'skins');
+      const cslDir = path.join(gd, 'CustomSkinLoader', 'LocalSkin', kind === 'cape' ? 'capes' : 'skins');
       try { fs.mkdirSync(cslDir, { recursive: true }); } catch (e) {}
       fs.writeFileSync(path.join(cslDir, safeUser + '.png'), buf);
       applied[kind] = activeFile;
+      if (kind === 'skin') {
+        const m = JSON.parse(fs.readFileSync(meta, 'utf8'));
+        applied.model = ((m.models || {})[activeFile] || (m.detected || {})[activeFile]) === 'slim' ? 'slim' : 'classic';
+      }
     } catch (e) { console.warn('[MGL2] applyActiveSkinCape', kind, e); }
   }
+  if (settings.get('useMglSc')) writeMglScActive(base, applied, path.join(gd, 'mgl'));
   return applied;
+}
+// MGL S&C читает <gameDir>/mgl/active.properties (java.util.Properties): skin/cape - абсолютные пути, model - slim|classic.
+// Пишем выбор лаунчера перед запуском, чтобы модель (Slim/Classic) и скин в игре совпадали с менеджером скинов.
+function writeMglScActive(base, applied, outDir) {
+  const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/=/g, '\\=')
+    .replace(/[^\x20-\x7e]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+  const file = (kind) => applied[kind] ? path.join(base, kind, applied[kind]) : '';
+  const lines = ['#MGL Skin - written by Magma Launcher', '#' + new Date().toString(),
+    'skin=' + esc(file('skin')), 'cape=' + esc(file('cape')), 'model=' + (applied.model || 'classic')];
+  try { fs.mkdirSync(outDir || base, { recursive: true }); fs.writeFileSync(path.join(outDir || base, 'active.properties'), lines.join('\n') + '\n'); }
+  catch (e) { console.warn('[MGL2] active.properties', e.message); }
 }
 
 function buildLaunchOptions(override) {
@@ -1770,12 +2006,26 @@ function buildLaunchOptions(override) {
   };
 }
 
-ipcMain.handle('mc:launch', async (e, { folder, username, memoryMax, quickPlay }) => {
+ipcMain.handle('mc:launch', async (e, args) => {
+  let { folder, username, memoryMax, quickPlay, instance } = args || {};
   const send = (progress, status) => sendRenderer('mc:progress', { progress, status });
+  // instance - id сборки: своя папка игры (gameDir) и ключ процесса inst:<id>; версия берётся из instance.json
+  let inst = null;
+  try {
+    if (instance) {
+      inst = instances.read(instance);
+      if (!inst) throw new Error('Сборка не найдена');
+      if (inst.state === 'installing') throw new Error('Сборка ещё устанавливается');
+      folder = inst.version;
+      if (!folder || !manager.isVersionInstalled(folder)) throw new Error('Версия сборки не установлена - выберите «Восстановить версию» в меню сборки');
+    }
+  } catch (err) { sendRenderer('mc:error', err.message); return { ok: false, error: err.message }; }
+  const key = inst ? 'inst:' + inst.id : folder;
+  const gameDir = inst ? instances.dirOf(inst.id) : null;
   try {
     send(5, 'Поиск Java…');
     const major = manager.javaMajorFor(folder);
-    const perInst = (settings.get('instanceJava') || {})[folder];
+    const perInst = (inst && inst.javaPath) || (settings.get('instanceJava') || {})[folder];
     const explicit = perInst || settings.get('javaPath');
 
     let javaPath = manager.resolveLaunchJava(major, explicit);
@@ -1787,25 +2037,25 @@ ipcMain.handle('mc:launch', async (e, { folder, username, memoryMax, quickPlay }
       if (!javaPath) throw new Error('Не удалось установить Java ' + major);
     }
     console.log('[MGL2] java:', javaPath, '(требуется Java', major, ')');
-    const mem = memoryMax || settings.get('memoryMax') || 2048;
+    const mem = (inst && inst.memory) || memoryMax || settings.get('memoryMax') || 2048;
     const name = username || settings.get('username');
     if (settings.get('useMglSc')) {
       send(10, 'MGL S&C…');
       try {
-        const r = mglApplyForLaunch(folder);
+        const r = mglApplyForLaunch(folder, gameDir ? path.join(gameDir, 'mods') : null);
         if (!r.ok) {
           sendRenderer('mc:notice', { level: 'error', text: r.message });
-          sendRenderer('mc:log', { folder, stream: 'stderr', line: '[MGL S&C] ' + r.message });
-        } else sendRenderer('mc:log', { folder, stream: 'stdout', line: '[MGL S&C] включён ' + r.file });
+          sendRenderer('mc:log', { folder: key, stream: 'stderr', line: '[MGL S&C] ' + r.message });
+        } else sendRenderer('mc:log', { folder: key, stream: 'stdout', line: '[MGL S&C] включён ' + r.file });
       } catch (err) { console.warn('[MGL2] MGL S&C', err.message); }
     }
     send(12, 'Подготовка скина/плаща…');
-    const applied = applyActiveSkinCape(name);
+    const applied = applyActiveSkinCape(name, gameDir);
     if (applied.skin || applied.cape) {
       console.log('[MGL2] applied', applied);
     }
     const launch = buildLaunchOptions({ quickPlay: quickPlay && quickPlay.type && quickPlay.value ? quickPlay : null });
-    const ctx = { folder, username: name, memoryMax: mem, javaPath, launch, cancelled: null, cancel(reason) { this.cancelled = reason || 'Запуск отменён плагином'; } };
+    const ctx = { folder, instance: inst, gameDir: gameDir || minecraftDir(), username: name, memoryMax: mem, javaPath, launch, cancelled: null, cancel(reason) { this.cancelled = reason || 'Запуск отменён плагином'; } };
     await plugins.emit('launch:before', ctx);
     if (ctx.cancelled) throw new Error(ctx.cancelled);
     if (launch.quickPlay && launch.quickPlay.type === 'multiplayer') {
@@ -1813,15 +2063,20 @@ ipcMain.handle('mc:launch', async (e, { folder, username, memoryMax, quickPlay }
       hist.unshift({ name: (quickPlay && quickPlay.name) || launch.quickPlay.value, ip: launch.quickPlay.value, ts: Date.now() });
       settings.update({ serverHistory: hist.slice(0, 20) });
     }
+    crashReporter.gameReset(key);
+    userStopped.delete(key);
+    crashReporter.note(`Запуск ${key} · ${folder} · Java ${major} (${javaPath}) · ${mem} МБ`);
     await manager.launchInstalled(folder, {
       username: ctx.username,
       memoryMax: ctx.memoryMax,
       javaPath: ctx.javaPath,
       launch: ctx.launch,
+      gameDir: gameDir || undefined, key,
       onAssetsProgress: (d) => sendRenderer('assets:progress', d),
       onProgress: send,
-      onLog: (entry) => { sendRenderer('mc:log', entry); plugins.emitSync('game:log', entry); },
+      onLog: (entry) => { crashReporter.gameLine(key, entry); sendRenderer('mc:log', entry); plugins.emitSync('game:log', entry); },
       onExit: (info) => {
+        try { reportGameExit(key, folder, gameDir, info); } catch (e) { console.warn('[MGL2] reportGameExit', e.message); }
         const addSec = info.seconds || 0;
         const prevSec = settings.get('playtimeSeconds') || 0;
         const totalSec = prevSec + addSec;
@@ -1830,27 +2085,55 @@ ipcMain.handle('mc:launch', async (e, { folder, username, memoryMax, quickPlay }
           playtimeMinutes: Math.floor(totalSec / 60)
         });
         settings.save();
+        if (inst) instances.recordPlay(inst.id, addSec);
         sendRenderer('mc:exit', { ...info, playtimeSeconds: totalSec });
-        plugins.emit('game:exit', { folder, ...info, playtimeSeconds: totalSec });
+        plugins.emit('game:exit', { folder, ...info, version: folder, instance: inst && inst.id, playtimeSeconds: totalSec });
+        try { restoreWindowAfterGame(); } catch (e) { console.warn('[MGL2] restoreWindow', e.message); }
       }
     });
 
-    const counts = settings.get('launchCounts') || {};
-    counts[folder] = (counts[folder] || 0) + 1;
-    settings.update({ launchCounts: counts, lastVersion: folder, username: name });
+    // у сборок счётчики/время в instance.json, а «Продолжить играть» (lastVersion) - только для версий Библиотеки
+    if (inst) settings.update({ username: name, lastInstance: inst.id });
+    else {
+      const counts = settings.get('launchCounts') || {};
+      counts[folder] = (counts[folder] || 0) + 1;
+      settings.update({ launchCounts: counts, lastVersion: folder, username: name });
+    }
     settings.save();
 
-    sendRenderer('mc:launched', { folder });
-    plugins.emit('launch:after', { folder, username: ctx.username });
+    sendRenderer('mc:launched', { folder: key, version: folder, instance: inst && inst.id });
+    plugins.emit('launch:after', { folder, instance: inst && inst.id, username: ctx.username });
+    applyWindowOnLaunch();
     return { ok: true };
   } catch (err) {
-    if (err && err.code === 'JAVA_MISSING') sendRenderer('java:missing', { major: err.major, folder });
+    if (err && err.code === 'JAVA_MISSING') sendRenderer('java:missing', { major: err.major, folder, instance: inst && inst.id });
+    crashReporter.note(`Ошибка запуска ${key}: ${err && err.message}`);
     sendRenderer('mc:error', err.message);
     return { ok: false, error: err.message };
   }
 });
 
-ipcMain.handle('mc:stop', (e, folder) => manager.stop(folder));
+// Игра закрылась с ненулевым кодом, и не мы её останавливали → отчёт (хвост лога + ссылка на crash-report самой игры)
+const userStopped = new Set();
+function reportGameExit(key, folder, gameDir, info) {
+  const wasStopped = userStopped.delete(key);
+  crashReporter.note(`Игра ${key} закрыта: код ${info.code}${info.signal ? ' сигнал ' + info.signal : ''}, ${info.seconds} с${wasStopped ? ' (остановлена пользователем)' : ''}`);
+  if (wasStopped || info.code === 0) return;
+  let gameCrashFile = null;
+  try {
+    const dir = path.join(gameDir || minecraftDir(), 'crash-reports');
+    const since = Date.now() - (info.seconds || 0) * 1000 - 5000;
+    const fresh = fs.readdirSync(dir).map(n => ({ n, t: fs.statSync(path.join(dir, n)).mtimeMs })).filter(x => x.t >= since).sort((a, b) => b.t - a.t)[0];
+    if (fresh) gameCrashFile = path.join(dir, fresh.n);
+  } catch (e) {}
+  crashReporter.report('game', {
+    title: folder,
+    error: `Игра завершилась с кодом ${info.code}${info.signal ? ' (сигнал ' + info.signal + ')' : ''} через ${info.seconds} с после запуска`,
+    gameTail: crashReporter.gameTail(key), gameCrashFile
+  });
+}
+
+ipcMain.handle('mc:stop', (e, folder) => { userStopped.add(folder); return manager.stop(folder); });
 ipcMain.handle('mc:running', () => manager.getRunning());
 
 ipcMain.handle('mc:deleteVersion', (e, folder) => {
@@ -1865,9 +2148,11 @@ ipcMain.handle('mc:deleteVersion', (e, folder) => {
     const aliases = settings.get('aliases') || {};
     const pinned = (settings.get('pinned') || []).filter(x => x !== folder);
     const counts = settings.get('launchCounts') || {};
+    const instJava = { ...(settings.get('instanceJava') || {}) };
     if (folder in aliases) delete aliases[folder];
     if (folder in counts) delete counts[folder];
-    settings.update({ aliases, pinned, launchCounts: counts });
+    delete instJava[folder];
+    settings.update({ aliases, pinned, launchCounts: counts, instanceJava: instJava });
     settings.save();
     return { ok: true };
   } catch (err) {
@@ -1899,16 +2184,24 @@ ipcMain.handle('mcdir:set', async (e, { target, migrate }) => {
   const send = (progress, status) => sendRenderer('mcdir:migrateProgress', { progress, status });
   try {
     if (!target || typeof target !== 'string') throw new Error('Пустой путь');
-    const src = minecraftDir();
+    const src = path.resolve(minecraftDir());
     const dst = path.resolve(target);
     // Если пользователь указал пустой «общий» каталог - создадим внутри него .minecraft
     const finalDst = path.basename(dst).toLowerCase() === '.minecraft' ? dst : path.join(dst, '.minecraft');
-    // Безопасность: не позволяем переносить в поддиректорию самого src
-    if ((finalDst + path.sep).startsWith(src + path.sep)) {
-      throw new Error('Новый путь не может быть внутри старого');
+    // в Windows регистр в путях не важен: «C:\Users» и «c:\users» - одна папка
+    const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p) + path.sep;
+    const same = norm(src) === norm(finalDst);
+    // Безопасность: не позволяем переносить в поддиректорию самого src (и наоборот)
+    if (!same && (norm(finalDst).startsWith(norm(src)) || norm(src).startsWith(norm(finalDst)))) {
+      throw new Error('Новая папка не может быть внутри старой (или содержать её)');
+    }
+    if (migrate && !same) {
+      if (manager.getRunning().length) throw new Error('Сначала закройте игру');
+      if (serverProcs.size) throw new Error('Сначала остановите серверы');
+      if ((manager.activeJobs() || []).length) throw new Error('Дождитесь окончания загрузок');
     }
 
-    if (migrate && fs.existsSync(src) && src !== finalDst) {
+    if (migrate && fs.existsSync(src) && !same) {
       send(1, 'Подсчёт файлов…');
       const files = [];
       const walk = (dir) => {
@@ -1924,17 +2217,23 @@ ipcMain.handle('mcdir:set', async (e, { target, migrate }) => {
       send(3, `Копирование ${files.length} файлов в ${finalDst}…`);
       try { fs.mkdirSync(finalDst, { recursive: true }); } catch (err) {}
       let i = 0;
+      const failed = [];
       for (const file of files) {
         const rel = path.relative(src, file);
         const to = path.join(finalDst, rel);
         try {
           fs.mkdirSync(path.dirname(to), { recursive: true });
           fs.copyFileSync(file, to);
-        } catch (err) { console.warn('[MGL2] copy fail', file, err.message); }
+          if (fs.statSync(to).size !== fs.statSync(file).size) throw new Error('размер не совпал');
+        } catch (err) { console.warn('[MGL2] copy fail', file, err.message); failed.push(rel); }
         i++;
         if (i % 50 === 0 || i === files.length) {
           send(3 + Math.floor((i / files.length) * 92), `Копирование ${i}/${files.length}`);
         }
+      }
+      // что-то не скопировалось - старую папку НЕ трогаем и путь не меняем (иначе пропадут миры)
+      if (failed.length) {
+        throw new Error(`Не скопировано ${failed.length} файлов (${failed.slice(0, 3).join(', ')}${failed.length > 3 ? '…' : ''}). Старая папка не тронута, путь не изменён`);
       }
       send(96, 'Удаление старой папки…');
       try { fs.rmSync(src, { recursive: true, force: true }); } catch (err) {
@@ -1962,6 +2261,14 @@ ipcMain.handle('mcdir:reset', () => {
   return { ok: true, path: defaultMinecraftDir() };
 });
 
+// Версия Java по пути к java(w).exe (…/bin/javaw.exe → home/release); для Java на сборку в меню сборки
+ipcMain.handle('java:inspect', (e, p) => {
+  try {
+    if (!p || !fs.existsSync(p)) return { ok: false, error: 'Файл не найден' };
+    const home = path.dirname(path.dirname(p));
+    return { ok: true, major: manager.javaMajorOfHome(home) || 0, ascii: /^[\x00-\x7F]*$/.test(p) };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
 ipcMain.handle('dialog:pickJava', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: 'Выберите исполняемый файл Java',
@@ -1981,10 +2288,154 @@ app.whenReady().then(() => {
   if (settings.get('useMglSc')) { try { mglEnsureCopies(); } catch (e) {} }
   // Нужен Windows для системных уведомлений (совпадает с build.appId → ярлык NSIS)
   if (process.platform === 'win32') app.setAppUserModelId('com.magmalauncher.mgl2');
+  applyLanguage();
   plugins.boot();
   createWindow();
+  crashReporter.note(`Лаунчер ${app.getVersion()} запущен`);
+  setTimeout(() => { try { rotateGameLogs(); } catch (e) { console.warn('[MGL2] rotateGameLogs', e.message); } }, 8000);
 });
 app.on('will-quit', () => { plugins.emitSync('app:quit', {}); plugins.unloadAll(); plugins.clearLock(); });
+
+// ---------- отчёты о сбоях (scripts/crash-reporter.js) ----------
+ipcMain.on('crash:renderer', (e, d) => {
+  d = d || {};
+  crashReporter.report('renderer', {
+    title: d.view ? 'вкладка «' + d.view + '»' : undefined,
+    error: d.stack || d.message || 'Ошибка в окне лаунчера',
+    details: { message: d.message, source: d.source, line: d.line, col: d.col, kind: d.kind }
+  });
+});
+ipcMain.handle('crash:list', () => ({
+  items: crashReporter.list(), dir: crashReporter.dir,
+  enabled: settings.get('crashReports') !== false, seenTs: settings.get('crashSeenTs') || 0
+}));
+ipcMain.handle('crash:read', (e, name) => { try { return { ok: true, text: crashReporter.read(name) }; } catch (err) { return { ok: false, error: err.message }; } });
+ipcMain.handle('crash:remove', (e, name) => ({ ok: crashReporter.remove(name) }));
+ipcMain.handle('crash:clear', () => { crashReporter.clear(); return { ok: true }; });
+ipcMain.handle('crash:seen', () => { settings.update({ crashSeenTs: Date.now() }); settings.save(); return { ok: true }; });
+ipcMain.handle('crash:test', () => {
+  const info = crashReporter.report('test', { title: 'проверка', error: new Error('Тестовый отчёт: на самом деле ничего не сломалось'), details: 'Создан кнопкой «Создать тестовый отчёт» в Настройках.' });
+  return info ? { ok: true, info } : { ok: false, error: settings.get('crashReports') === false ? 'Сохранение отчётов выключено' : 'Слишком много одинаковых отчётов за сессию' };
+});
+ipcMain.on('crash:reveal', (e, name) => { try { shell.showItemInFolder(crashReporter.safePath(name)); } catch (err) {} });
+ipcMain.on('crash:openDir', () => { try { fs.mkdirSync(crashReporter.dir, { recursive: true }); shell.openPath(crashReporter.dir); } catch (err) {} });
+
+// ---------- логи игры: размер, очистка, автоочистка ----------
+function gameRoots() {
+  const roots = [minecraftDir()];
+  try {
+    fs.readdirSync(instances.root(), { withFileTypes: true }).filter(d => d.isDirectory()).forEach(d => roots.push(path.join(instances.root(), d.name)));
+  } catch (e) {}
+  return roots;
+}
+function filesIn(dir) {
+  const out = [];
+  const walk = (d) => {
+    let items = [];
+    try { items = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+    for (const it of items) {
+      const full = path.join(d, it.name);
+      if (it.isDirectory()) walk(full);
+      else { try { const st = fs.statSync(full); out.push({ full, name: it.name, size: st.size, mtime: st.mtimeMs }); } catch (e) {} }
+    }
+  };
+  walk(dir);
+  return out;
+}
+// scope: game-logs (<dir>/logs) | game-crashes (<dir>/crash-reports) | launcher (отчёты лаунчера) | plugins (plugin-logs)
+function scopeDirs(scope) {
+  if (scope === 'launcher') return [crashReporter.dir];
+  if (scope === 'plugins') return [plugins.logsDir];
+  const sub = scope === 'game-crashes' ? 'crash-reports' : 'logs';
+  return gameRoots().map(r => path.join(r, sub));
+}
+function gameBusy() { try { return manager.getRunning().length > 0; } catch (e) { return false; } }
+// латест/дебаг-лог занят запущенной игрой - не трогаем
+const keepWhenBusy = (f) => gameBusy() && /^(latest|debug)\.log$/i.test(f.name);
+ipcMain.handle('logs:info', () => {
+  const res = {};
+  for (const scope of ['game-logs', 'game-crashes', 'launcher', 'plugins']) {
+    let count = 0, size = 0;
+    scopeDirs(scope).forEach(d => filesIn(d).forEach(f => { count++; size += f.size; }));
+    res[scope] = { count, size };
+  }
+  res.keepDays = settings.get('logKeepDays');
+  return res;
+});
+ipcMain.handle('logs:clear', (e, scope) => {
+  if (!['game-logs', 'game-crashes', 'launcher', 'plugins'].includes(scope)) return { ok: false, error: 'Неизвестный раздел' };
+  let removed = 0, freed = 0, locked = 0;
+  scopeDirs(scope).forEach(d => filesIn(d).forEach(f => {
+    if (scope.startsWith('game') && keepWhenBusy(f)) { locked++; return; }
+    try { fs.unlinkSync(f.full); removed++; freed += f.size; } catch (err) { locked++; }
+  }));
+  return { ok: true, removed, freed, locked };
+});
+ipcMain.on('logs:open', (e, scope) => {
+  try {
+    const d = scope === 'launcher' ? crashReporter.dir : scope === 'plugins' ? plugins.logsDir
+      : path.join(minecraftDir(), scope === 'game-crashes' ? 'crash-reports' : 'logs');
+    fs.mkdirSync(d, { recursive: true });
+    shell.openPath(d);
+  } catch (err) {}
+});
+// Раз при старте: удалить логи и crash-report'ы игры старше logKeepDays
+function rotateGameLogs() {
+  const days = parseInt(settings.get('logKeepDays'), 10);
+  if (!(days > 0)) return;
+  const limit = Date.now() - days * 864e5;
+  ['game-logs', 'game-crashes'].forEach(scope => scopeDirs(scope).forEach(d => filesIn(d).forEach(f => {
+    if (f.mtime < limit && !keepWhenBusy(f)) { try { fs.unlinkSync(f.full); } catch (err) {} }
+  })));
+}
+
+// ---------- картинки сборок (Библиотека) на диске: <.minecraft>/mgl/icons ----------
+// Раньше лежали в localStorage рендерера (data-URL). art.js читает всё синхронно при старте.
+const iconsDir = () => path.join(minecraftDir(), 'mgl', 'icons');
+function iconsIndex() { try { return JSON.parse(fs.readFileSync(path.join(iconsDir(), 'index.json'), 'utf8')) || {}; } catch (e) { return {}; } }
+function iconsWriteIndex(idx) { fs.mkdirSync(iconsDir(), { recursive: true }); fs.writeFileSync(path.join(iconsDir(), 'index.json'), JSON.stringify(idx, null, 2)); }
+function iconUrl(file) {
+  try { const f = path.join(iconsDir(), file); return require('url').pathToFileURL(f).href + '?v=' + Math.floor(fs.statSync(f).mtimeMs); } catch (e) { return null; }
+}
+function iconSave(idx, id, dataUrl) {
+  const m = /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,([A-Za-z0-9+/=\s]+)$/i.exec(String(dataUrl || ''));
+  if (!m) return null;
+  const ext = m[1].toLowerCase().replace('jpeg', 'jpg').replace('svg+xml', 'svg');
+  const file = require('crypto').createHash('sha1').update(String(id)).digest('hex').slice(0, 16) + '.' + ext;
+  fs.mkdirSync(iconsDir(), { recursive: true });
+  if (idx[id] && idx[id] !== file) { try { fs.unlinkSync(path.join(iconsDir(), idx[id])); } catch (e) {} }
+  fs.writeFileSync(path.join(iconsDir(), file), Buffer.from(m[2], 'base64'));
+  idx[id] = file;
+  return iconUrl(file);
+}
+ipcMain.on('icons:loadAll', (e) => {
+  const idx = iconsIndex(), out = {};
+  Object.entries(idx).forEach(([id, file]) => { const u = iconUrl(file); if (u) out[id] = u; });
+  e.returnValue = out;
+});
+ipcMain.on('icons:save', (e, id, dataUrl) => {
+  try { const idx = iconsIndex(); const u = iconSave(idx, id, dataUrl); if (u) iconsWriteIndex(idx); e.returnValue = u; }
+  catch (err) { console.warn('[MGL2] icons:save', err.message); e.returnValue = null; }
+});
+ipcMain.on('icons:remove', (e, id) => {
+  try {
+    const idx = iconsIndex();
+    if (idx[id]) { try { fs.unlinkSync(path.join(iconsDir(), idx[id])); } catch (err) {} delete idx[id]; iconsWriteIndex(idx); }
+  } catch (err) {}
+  e.returnValue = true;
+});
+// одноразовый перенос из localStorage: { id: dataUrl } → файлы; возвращает новые URL и число неудач
+ipcMain.on('icons:migrate', (e, old) => {
+  const urls = {}; let failed = 0;
+  try {
+    const idx = iconsIndex();
+    Object.entries(old || {}).forEach(([id, data]) => {
+      try { const u = idx[id] ? iconUrl(idx[id]) : iconSave(idx, id, data); if (u) urls[id] = u; else failed++; } catch (err) { failed++; }
+    });
+    iconsWriteIndex(idx);
+  } catch (err) { failed = Object.keys(old || {}).length; }
+  e.returnValue = { urls, failed };
+});
 
 const pluginsOk = (fn) => async (e, arg) => {
   try { const r = await fn(arg); return { ok: true, ...(r || {}), state: plugins.describe() }; }
@@ -2024,8 +2475,22 @@ ipcMain.on('plugins:open', (e, what) => {
   try { fs.mkdirSync(target, { recursive: true }); } catch (err) {}
   shell.openPath(target);
 });
-ipcMain.handle('plugins:readDocs', () => {
-  const cands = [app.isPackaged && process.resourcesPath ? path.join(process.resourcesPath, 'PLUGINS.md') : null, path.join(__dirname, '..', 'PLUGINS.md')].filter(Boolean);
+// Руководство по плагинам: свежая версия с GitHub (docs/PLUGINS.md), при ошибке сети - кэш, затем файл из папки лаунчера
+const PLUGINS_DOC_URL = `https://raw.githubusercontent.com/${UPDATE_REPO}/main/docs/PLUGINS.md`;
+ipcMain.handle('plugins:readDocs', async () => {
+  const cache = path.join(settings.dir, 'PLUGINS.cache.md');
+  try {
+    const text = (await netBuffer(PLUGINS_DOC_URL)).toString('utf8');
+    if (text.trim()) {
+      try { fs.mkdirSync(settings.dir, { recursive: true }); fs.writeFileSync(cache, text); } catch (e) {}
+      return text;
+    }
+  } catch (e) { console.warn('[MGL2] plugins:readDocs github', e.message); }
+  const cands = [
+    cache,
+    app.isPackaged && process.resourcesPath ? path.join(process.resourcesPath, 'PLUGINS.md') : null,
+    path.join(__dirname, '..', 'docs', 'PLUGINS.md')
+  ].filter(Boolean);
   const f = cands.find(x => fs.existsSync(x));
   try { return f ? fs.readFileSync(f, 'utf8') : ''; } catch (e) { return ''; }
 });
