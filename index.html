@@ -109,9 +109,10 @@
     <div class="game-log-head">
       <div class="game-log-title">Лог игры <span class="game-log-sub" id="game-log-sub"></span></div>
       <div class="game-log-actions">
-        <button class="btn-ghost" id="game-log-clear" title="Очистить">Очистить</button>
-        <button class="btn-ghost" id="game-log-stop" title="Остановить игру">Стоп</button>
-        <button class="btn-ghost" id="game-log-close" title="Свернуть">×</button>
+        <button class="btn-ghost btn-ico" id="game-log-copy" title="Копировать лог"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg></button>
+        <button class="btn-ghost btn-ico" id="game-log-clear" title="Очистить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>
+        <button class="btn-ghost btn-ico" id="game-log-stop" title="Остановить игру"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
+        <button class="btn-ghost btn-ico" id="game-log-close" title="Свернуть">×</button>
       </div>
     </div>
     <div class="game-log-body" id="game-log-body"></div>
@@ -252,8 +253,10 @@
   <script src="scripts/obj-scene.js"></script>
   <script src="scripts/custom-select.js"></script>
   <script src="scripts/seasonal.js"></script>
+  <script src="scripts/mgl-egg.js"></script>
   <script src="scripts/ui.js"></script>
   <script src="scripts/packs.js"></script>
+  <script src="scripts/extras-ui.js"></script>
   <script src="scripts/plugins.js"></script>
 </body>
 </html>

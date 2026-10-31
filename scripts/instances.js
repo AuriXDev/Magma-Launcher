@@ -235,6 +235,106 @@ module.exports = function createInstances(deps) {
       source: { type: 'mrpack', file: path.basename(p.file), versionNumber: pack.index.versionId || null, summary: pack.index.summary || '' }
     }, (dir, send) => installMrpackInto(dir, pack, buf, send));
   });
+  // ---- CurseForge (.zip с manifest.json) ----
+  // Файлы качаются через публичную ссылку curseforge.com/api/v1/mods/<проект>/files/<файл>/download (редирект на CDN) - ключ API не нужен.
+  // Моды с запретом на сторонние загрузки CurseForge не отдаёт: они пропускаются и перечисляются в итоге.
+  function readCurse(buf) {
+    const entries = zip.listEntries(buf).map(e => ({ ...e, name: e.name.replace(/\\/g, '/') }));
+    const me = entries.find(e => e.name === 'manifest.json');
+    if (!me) throw new Error('Это не модпак CurseForge: нет manifest.json');
+    const man = JSON.parse(zip.readFile(buf, me).toString('utf8'));
+    if (!man.minecraft || !man.minecraft.version) throw new Error('В модпаке не указана версия Minecraft');
+    const ml = (man.minecraft.modLoaders || []).find(l => l.primary) || (man.minecraft.modLoaders || [])[0];
+    let loader = 'vanilla', loaderVersion = null;
+    if (ml && ml.id) {
+      const m = /^(neoforge|forge|fabric|quilt)-(.+)$/i.exec(ml.id);
+      if (m) { loader = m[1].toLowerCase(); loaderVersion = m[2]; }
+    }
+    return { entries, manifest: man, mc: String(man.minecraft.version), loader, loaderVersion };
+  }
+  const { net } = require('electron');
+  function curseRedirect(pid, fid) {
+    return new Promise((resolve, reject) => {
+      const req = net.request({ url: `https://www.curseforge.com/api/v1/mods/${pid}/files/${fid}/download`, redirect: 'manual' });
+      req.setHeader('User-Agent', 'MGL2/0.1');
+      let settled = false;
+      const fin = (fn, v) => { if (!settled) { settled = true; fn(v); } };
+      req.on('redirect', (status, method, url) => { fin(resolve, url); try { req.abort(); } catch (err) {} });
+      req.on('response', (res) => { fin(reject, new Error('HTTP ' + res.statusCode)); try { req.abort(); } catch (err) {} });
+      req.on('error', (err) => fin(reject, err));
+      req.end();
+    });
+  }
+  async function installCurseInto(dir, pack, buf, send) {
+    send(1, `Версия ${pack.mc}${pack.loader !== 'vanilla' ? ' + ' + pack.loader + ' ' + pack.loaderVersion : ''}…`);
+    const version = await ensureVersion(pack.mc, pack.loader, pack.loaderVersion, (p, s) => send(1 + Math.floor(p * 0.39), s));
+    const files = (pack.manifest.files || []).filter(f => f.projectID && f.fileID);
+    const m = getManager();
+    const modsDir = path.join(dir, 'mods');
+    fs.mkdirSync(modsDir, { recursive: true });
+    let done = 0, i = 0;
+    const failed = [];
+    const worker = async () => {
+      while (i < files.length) {
+        const f = files[i++];
+        try {
+          const url = await curseRedirect(f.projectID, f.fileID);
+          const name = decodeURIComponent(path.basename(new URL(url).pathname)).replace(/[\/:*?"<>|]/g, '_');
+          const dest = path.join(modsDir, name);
+          if (!fs.existsSync(dest)) await m._download(url, dest);
+        } catch (err) {
+          if (MinecraftManager.isCancelled(err)) throw err;
+          failed.push(`${f.projectID}/${f.fileID}`);
+        }
+        done++;
+        send(40 + Math.floor(done / Math.max(1, files.length) * 50), `Моды ${done}/${files.length}`);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(6, files.length) }, worker));
+    send(92, 'Распаковка overrides…');
+    const ov = String(pack.manifest.overrides || 'overrides').replace(/\/+$/, '') + '/';
+    for (const e of pack.entries) {
+      if (!e.name.startsWith(ov) || e.name.endsWith('/')) continue;
+      const dest = inside(dir, e.name.slice(ov.length));
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, zip.readFile(buf, e));
+    }
+    return { version, skipped: failed };
+  }
+  // единая точка для .mrpack и CurseForge .zip
+  function sniffPack(buf) {
+    const names = zip.listEntries(buf).map(e => e.name.replace(/\\/g, '/'));
+    return names.includes('modrinth.index.json') ? 'mrpack' : names.includes('manifest.json') ? 'curse' : null;
+  }
+  ipcMain.handle('inst:peekPack', (e, file) => {
+    try {
+      const buf = fs.readFileSync(file);
+      const kind = sniffPack(buf);
+      if (kind === 'curse') {
+        const p = readCurse(buf);
+        return { ok: true, kind, name: p.manifest.name || '', summary: p.manifest.author ? 'Автор: ' + p.manifest.author : '', mc: p.mc, loader: p.loader, loaderVersion: p.loaderVersion, files: (p.manifest.files || []).length };
+      }
+      const pack = readMrpack(buf);
+      return { ok: true, kind: 'mrpack', name: pack.index.name, summary: pack.index.summary || '', mc: pack.mc, loader: pack.loader, loaderVersion: pack.loaderVersion, files: (pack.index.files || []).length };
+    } catch (err) { return { ok: false, error: err.message }; }
+  });
+  ipcMain.handle('inst:importCurse', async (e, p = {}) => {
+    let buf, pack;
+    try {
+      if (!p.file || !/\.zip$/i.test(p.file) || !fs.existsSync(p.file)) throw new Error('Выберите .zip модпака CurseForge');
+      buf = fs.readFileSync(p.file);
+      pack = readCurse(buf);
+    } catch (err) { return { ok: false, error: err.message }; }
+    const name = String(p.name || '').trim() || pack.manifest.name || path.basename(p.file, '.zip');
+    const id = uniqueId(name);
+    const res = await runCreate(id, {
+      name, mc: pack.mc, loader: pack.loader, loaderVersion: pack.loaderVersion,
+      source: { type: 'curseforge', file: path.basename(p.file), versionNumber: pack.manifest.version || null, summary: pack.manifest.author ? 'Автор: ' + pack.manifest.author : '' }
+    }, (dir, send) => installCurseInto(dir, pack, buf, send));
+    if (res.ok && res.instance && res.instance.skipped) res.skipped = res.instance.skipped;
+    return res;
+  });
+
   ipcMain.handle('inst:peekMrpack', (e, file) => {
     try {
       const pack = readMrpack(fs.readFileSync(file));
@@ -263,7 +363,14 @@ module.exports = function createInstances(deps) {
       const cur = read(id);
       if (!cur) throw new Error('Сборка не найдена');
       const allowed = {};
-      ['name', 'memory', 'javaPath', 'notes'].forEach(k => { if (patch && k in patch) allowed[k] = patch[k]; });
+      ['name', 'memory', 'javaPath', 'notes', 'jvmArgs', 'resolution', 'fullscreen'].forEach(k => { if (patch && k in patch) allowed[k] = patch[k]; });
+      if ('jvmArgs' in allowed) allowed.jvmArgs = String(allowed.jvmArgs || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 500) || null;
+      if ('resolution' in allowed) {
+        const r = allowed.resolution;
+        const w = r && parseInt(r.width, 10), h = r && parseInt(r.height, 10);
+        allowed.resolution = w >= 320 && h >= 240 && w <= 16384 && h <= 16384 ? { width: w, height: h } : null;
+      }
+      if ('fullscreen' in allowed) allowed.fullscreen = typeof allowed.fullscreen === 'boolean' ? allowed.fullscreen : null;
       if ('name' in allowed) allowed.name = String(allowed.name || '').trim().slice(0, 60) || cur.name;
       return { ok: true, instance: describe(write(id, allowed)) };
     } catch (err) { return { ok: false, error: err.message }; }

@@ -52,7 +52,7 @@
 
   const NEWS_URL = 'https://gist.githubusercontent.com/AuriXDev/664e23438029adb3993d89fa2213dbfe/raw/data.json';
   const NEWS_REFRESH_MS = 20 * 60 * 1000;
-  const LAUNCHER_VERSION = '2.0.1';
+  const LAUNCHER_VERSION = '2.0.3';
   let _newsItems = [];
   let _newsLoaded = false;
   let _remoteMeta = { latestVersion: null, updateRepo: null };
@@ -110,6 +110,26 @@
   }
   // Сплеш: сверка с последним релизом GitHub; есть новее → качаем с прогрессом на сплеше и запускаем установщик.
   // true = установщик запущен (лаунчер сейчас закроется).
+  function askUpdateDialog(info) {
+    return new Promise(resolve => {
+      const wrap = document.createElement('div');
+      wrap.className = 'modal-wrap upd-ask';
+      wrap.style.zIndex = '100000';
+      wrap.innerHTML = `
+        <div class="modal">
+          <div class="modal-head"><div class="modal-title">Доступно обновление ${escapeHtml(info.tag || info.version)}</div></div>
+          <div class="modal-body"><div class="field-hint">У вас версия ${escapeHtml(LAUNCHER_VERSION)}. Установить новую сейчас? Лаунчер перезапустится после установки.<br>«Пропустить» - не предлагать эту версию, вы узнаете о следующем обновлении.</div></div>
+          <div class="modal-foot">
+            <button class="btn-secondary" data-ans="skip">Пропустить</button>
+            <button class="btn-secondary" data-ans="later">Потом</button>
+            <button class="btn primary" data-ans="update" translate="no">${window.MglI18n && MglI18n.lang === 'en' ? 'Update' : 'Обновить'}</button>
+          </div>
+        </div>`;
+      document.body.appendChild(wrap);
+      wrap.querySelectorAll('[data-ans]').forEach(b => b.addEventListener('click', () => { wrap.remove(); resolve(b.dataset.ans); }));
+      const ok = wrap.querySelector('[data-ans="update"]'); if (ok) ok.focus();
+    });
+  }
   async function splashAutoUpdate() {
     const ipc = getIpc();
     if (!ipc) return false;
@@ -120,6 +140,11 @@
     if (cmpAppVer(info.version, LAUNCHER_VERSION) <= 0) return false;
     _remoteMeta.latestVersion = info.version;
     if (!info.packaged) { console.info('[update] dev-запуск: найдено', info.tag, '- автоустановка пропущена'); return false; }
+    // пропущенную версию не предлагаем снова - только следующую после неё
+    if (((D.settings || {}).skippedUpdate || '') === info.version) return false;
+    const choice = await askUpdateDialog(info);
+    if (choice === 'skip') { saveSettings({ skippedUpdate: info.version }); return false; }
+    if (choice !== 'update') return false;
     Splash.setUpdating(true);
     Splash.step(0, `Найдено обновление ${info.tag} - скачивание…`);
     const onProg = (e, d) => Splash.step(d.progress || 0, `Обновление ${info.tag}: ${d.status || ''} ${d.progress != null ? d.progress + '%' : ''}`.trim());
@@ -376,7 +401,9 @@
     const ipc = getIpc();
     if (!ipc) { toast('Установка доступна только в приложении'); return; }
     if (browseState.projectType === 'modpack') {
-      toast('Установка .mrpack пока не поддерживается - откройте страницу проекта');
+      const hit = browseState.hits.find(x => x.slug === slug || x.project_id === slug) || { slug };
+      if (window.MglPacks && MglPacks.installModpack) MglPacks.installModpack(hit);
+      else toast('Модули сборок не загружены');
       return;
     }
     // Берём заголовок из карточки
@@ -444,6 +471,8 @@
     if (loader) loader.addEventListener('change', () => { browseState.loader = loader.value; runBrowseSearch(); });
     const reload = content.querySelector('#browse-reload');
     if (reload) reload.addEventListener('click', () => runBrowseSearch(false));
+    const impBtn = content.querySelector('#browse-import-mrpack');
+    if (impBtn) impBtn.addEventListener('click', () => { if (window.MglPacks) MglPacks.importMrpack(); });
     const moreBtn = content.querySelector('#browse-more-btn');
     if (moreBtn) moreBtn.addEventListener('click', () => runBrowseSearch(true));
     content.removeEventListener('scroll', onBrowseScroll);
@@ -534,6 +563,8 @@
             <button class="btn sm icon" data-act="copy" title="Копировать IP сервера">${I.copy}</button>
             <button class="btn sm icon" data-act="restart" title="Перезапустить">${I.restart}</button>
             <button class="btn sm icon" data-act="storage" title="Открыть папку сервера">${I.folder}</button>
+            <button class="btn sm icon" data-act="players" title="Игроки онлайн: кик, бан, OP">${I.globe || I.box}</button>
+            <button class="btn sm icon" data-act="backup" title="Сделать бэкап сервера">${I.dl}</button>
             <button class="btn sm icon" data-act="config" title="Параметры и server.properties">${I.sliders}</button>
             <button class="btn sm" data-act="clear">Очистить лог</button>
             <button class="btn sm danger" data-act="kill" title="Завершить процесс без сохранения">Убить</button>
@@ -696,6 +727,7 @@
           <button class="btn-secondary" id="mc-add">${I.plus} Добавить файлы</button>
           <button class="btn-secondary" id="mc-all-on">Включить все</button>
           <button class="btn-secondary" id="mc-all-off">Отключить все</button>
+          ${_myContentType === 'mod' ? '<button class="btn-secondary" id="mc-updates">Обновления модов</button>' : ''}
           <input type="file" id="mc-file" multiple hidden accept="${_myContentType === 'mod' ? '.jar' : '.zip'}">
         </div>
         <div id="mc-drop" class="mc-drop" title="Перетащите файлы сюда">
@@ -730,7 +762,7 @@
         mod: 'Моды с Modrinth. Устанавливаются в .minecraft/mods/',
         resourcepack: 'Ресурспаки с Modrinth. Устанавливаются в .minecraft/resourcepacks/',
         shader: 'Шейдеры с Modrinth. Устанавливаются в .minecraft/shaderpacks/',
-        modpack: 'Модпаки с Modrinth. Пока только ссылка на страницу проекта'
+        modpack: 'Модпаки с Modrinth. Устанавливаются отдельной сборкой, свой .mrpack можно импортировать кнопкой справа'
       }[st.projectType];
       return `
       <div class="view">
@@ -741,6 +773,7 @@
           <input id="browse-search" class="input" type="text" placeholder="Поиск по Modrinth…" value="${escapeHtml(st.query || '')}">
           <select id="browse-ver" class="select">${verOpts}</select>
           ${st.projectType === 'mod' || st.projectType === 'modpack' ? `<select id="browse-loader" class="select">${loaderOpts}</select>` : ''}
+          ${st.projectType === 'modpack' ? '<button id="browse-import-mrpack" class="btn-secondary">Импорт .mrpack</button>' : ''}
           <button id="browse-reload" class="btn-secondary" title="Обновить">↻</button>
         </div>
         <div id="browse-status" class="browse-status">Загрузка…</div>
@@ -850,7 +883,7 @@
         <div class="settings-card update-card">
           <div class="update-top">
             <div>
-              <div class="update-title">Magma Launcher <span class="update-ver">v${LAUNCHER_VERSION}</span></div>
+              <div class="update-title">${uiPrefs().noEgg ? 'Magma Launcher' : '<span class="mgl-title" id="mgl-egg" translate="no" title="M G L - попробуйте поменять буквы местами"><span class="mgl-letter" draggable="true" data-ch="M">M</span><span class="mgl-letter" draggable="true" data-ch="G">G</span><span class="mgl-letter" draggable="true" data-ch="L">L</span></span>'} <span class="update-ver">v${LAUNCHER_VERSION}</span></div>
               <div class="update-sub" id="upd-sub">${isUpdateAvailable() ? `Доступна версия ${escapeHtml(_remoteMeta.latestVersion)}` : 'Нажмите, чтобы сверить версию с сервером'}</div>
             </div>
             <button class="btn-secondary update-btn ${isUpdateAvailable() ? 'glow' : ''}" id="upd-btn">${isUpdateAvailable() ? 'Скачать обновление' : 'Проверить обновления'}</button>
@@ -868,7 +901,8 @@
           <div class="field"><label class="field-label">Никнейм</label>
             <input type="text" id="set-username" value="${escapeHtml(s.username || D.profile.name)}"></div>
           <div class="toggle-row"><div><div class="tl">Использовать MGL S&amp;C</div><div class="ts">Локальная смена скинов и плащей в игре с помощью мода Magma Skin &amp; Cape</div>
-            <div class="ts mglsc-versions" id="mglsc-versions"></div></div>
+            <div class="ts mglsc-versions" id="mglsc-versions"></div>
+            <div class="ts"><a href="#" id="mglsc-update">Проверить обновления мода</a></div></div>
             <div class="switch ${s.useMglSc ? 'on' : ''}" id="mglsc-switch"></div></div>
         </div>
         <div class="settings-card">
@@ -925,8 +959,12 @@
             ${uiPrefToggle('noAnimations', 'Отключить плавные анимации', 'Мгновенные переходы без анимаций', s)}
             ${uiPrefToggle('trafficSaver', 'Экономия трафика', 'Без иконок Modrinth и автообновления новостей', s)}
             ${uiPrefToggle('noBackground', 'Отключить фон', 'Скрыть анимированный и пользовательский фон', s)}
-            ${uiPrefToggle('noSeasonal', 'Отключить сезонные эффекты', 'Снег зимой, сердечки на 14 февраля и другие праздничные эффекты', s)}          </div>
+            ${uiPrefToggle('noSeasonal', 'Отключить сезонные эффекты', 'Снег зимой, сердечки на 14 февраля и другие праздничные эффекты', s)}
+            ${uiPrefToggle('noEgg', 'Отключить пасхалки', 'Буквы MGL в заголовке настроек и связанные с ними эффекты и звук', s)}
+          </div>
         </div>
+
+        ${window.MglExtras ? MglExtras.backupsCardHtml() : ''}
 
         <div class="settings-card">
           <h3>Уведомления</h3>
@@ -2140,6 +2178,11 @@
           <div class="field"><label class="field-label">Название</label><input type="text" id="mc-name" value="${escapeHtml(srv.name)}"></div>
           <div class="field"><label class="field-label">Память (МБ)</label><input type="number" id="mc-mem" min="512" step="256" value="${srv.memory || 1024}"></div>
         </div>
+        <div class="prop-grid3">
+          <div class="field"><label class="field-label">Перезапуск каждые N ч (0 - выкл)</label><input type="number" id="mc-restart" min="0" max="168" value="${srv.restartHours || 0}"></div>
+          <div class="field"><label class="field-label">Бэкап каждые N ч (0 - выкл)</label><input type="number" id="mc-backup" min="0" max="168" value="${srv.backupHours || 0}"></div>
+        </div>
+        <div class="toggle-row"><div><div class="tl">Запускать вместе с лаунчером</div><div class="ts">Сервер стартует автоматически при открытии лаунчера</div></div><div class="switch ${srv.autoStart ? 'on' : ''}" id="mc-auto"></div></div>
         <div class="field"><label class="field-label">Доп. JVM-аргументы</label><input type="text" id="mc-jvm" value="${escapeHtml(srv.jvmArgs || '')}" placeholder="-XX:+UseG1GC" spellcheck="false"></div>
         <div class="prop-section prop-section-row"><span>server.properties</span>
           <input type="text" id="prop-search" class="prop-search" placeholder="Поиск параметра…" spellcheck="false"></div>
@@ -2163,7 +2206,8 @@
           if (v !== shown) changed[key] = v;
         });
         if (bad) { toast('Неверное значение: ' + bad); return false; }
-        const patch = { name: m.querySelector('#mc-name').value, memory: m.querySelector('#mc-mem').value, jvmArgs: m.querySelector('#mc-jvm').value };
+        const patch = { name: m.querySelector('#mc-name').value, memory: m.querySelector('#mc-mem').value, jvmArgs: m.querySelector('#mc-jvm').value,
+          restartHours: m.querySelector('#mc-restart').value, backupHours: m.querySelector('#mc-backup').value, autoStart: m.querySelector('#mc-auto').classList.contains('on') };
         const r1 = await ipc.invoke('srv:updateManaged', { id: srv.id, patch });
         if (!r1 || !r1.ok) { toast('Ошибка: ' + ((r1 && r1.error) || '')); return false; }
         Object.assign(srv, r1.entry);
@@ -2180,7 +2224,7 @@
       }
     });
     const wrap = document.getElementById('app-modal');
-    wrap.querySelectorAll('.prop-list .switch').forEach(sw => sw.addEventListener('click', () => sw.classList.toggle('on')));
+    wrap.querySelectorAll('.prop-list .switch, #mc-auto').forEach(sw => sw.addEventListener('click', () => sw.classList.toggle('on')));
     const search = wrap.querySelector('#prop-search');
     search.addEventListener('input', () => {
       const q = search.value.trim().toLowerCase();
@@ -2212,6 +2256,15 @@
           else if (act === 'restart' || act === 'kill') srvAction(id, act);
           else if (act === 'join') quickJoin('localhost:' + (srvRuntime(id).port || 25565), srv ? srv.name : 'Локальный сервер');
           else if (act === 'config') openManagedConfigModal(srv);
+          else if (act === 'players') { if (window.MglExtras && srv) MglExtras.playersModal(srv); }
+          else if (act === 'backup') {
+            const ipc = getIpc();
+            if (!ipc) { toast('Доступно в приложении'); return; }
+            btn.disabled = true; toast('Делаю бэкап сервера…');
+            const r = await ipc.invoke('srv:backup', id);
+            btn.disabled = false;
+            toast(r && r.ok ? `Бэкап сервера сохранён (${fmtBytes(r.size)})` : 'Не удалось: ' + ((r && r.error) || ''));
+          }
           else if (act === 'clear') {
             const ipc = getIpc();
             if (ipc) await ipc.invoke('srv:clearLog', id);
@@ -2441,6 +2494,7 @@
       disposeBgEditor();
       if (_themeDraft) { _themeDraft = null; _themePickers = null; applyCurrentTheme(); }
     }
+    if (window.MglEgg) MglEgg.unmount();
     if (currentView) UiBus.emit('view:leave', { name: currentView, next: name });
     currentView = name;
     content.innerHTML = views[name]();
@@ -2449,6 +2503,7 @@
     document.querySelectorAll('.nav-link[data-view]').forEach(el => el.classList.toggle('active', el.dataset.view === name));
     document.getElementById('breadcrumb-current').textContent = TITLES[name] || name;
     bindViewEvents();
+    if (name === 'settings' && window.MglEgg) MglEgg.mount({ notify: (t) => toast(t) });
     UiBus.emit('view:render', { name, root: content });
   }
 
@@ -2727,6 +2782,8 @@
     const on = content.querySelector('#mc-all-on'), off = content.querySelector('#mc-all-off');
     if (on) on.addEventListener('click', () => bulk(true));
     if (off) off.addEventListener('click', () => bulk(false));
+    const upd = content.querySelector('#mc-updates');
+    if (upd) upd.addEventListener('click', () => window.MglExtras && MglExtras.checkUpdates({ onDone: loadMyContent }));
   }
   async function loadMyContent() {
     const listEl = document.getElementById('mycontent-list');
@@ -2830,7 +2887,8 @@
       noAnimations: all || !!s.noAnimations,
       trafficSaver: all || !!s.trafficSaver,
       noBackground: all || !!s.noBackground,
-      noSeasonal: all || !!s.noSeasonal
+      noSeasonal: all || !!s.noSeasonal,
+      noEgg: all || !!s.noEgg
     };
   }
   function applySeasonal() {
@@ -5898,6 +5956,18 @@
     if (!sw) return;
     const ipc = getIpc();
     if (ipc && info) { try { info.textContent = mglVersionsText((await ipc.invoke('mglsc:info')).mods); } catch (e) {} }
+    const upd = content.querySelector('#mglsc-update');
+    if (upd) upd.addEventListener('click', async (e) => {
+      e.preventDefault();
+      if (!ipc) { toast('Обновление доступно в приложении'); return; }
+      if (upd.dataset.busy) return;
+      upd.dataset.busy = '1';
+      const r = await ipc.invoke('mglsc:update').catch(err => ({ ok: false, error: err.message }));
+      delete upd.dataset.busy;
+      if (!r || !r.ok) { toast('Не удалось проверить обновления MGL S&C: ' + ((r && r.error) || '')); return; }
+      if (info) info.textContent = mglVersionsText(r.mods);
+      toast(r.updated.length ? `MGL S&C обновлён: ${r.updated.join(', ')}` : 'Установлены все версии MGL S&C');
+    });
     sw.addEventListener('click', async () => {
       if (sw.dataset.busy) return;
       const on = !sw.classList.contains('on');
@@ -5983,6 +6053,7 @@
   function initSettingsExtras() {
     initSettingsCollapse();
     bindMglSc();
+    if (window.MglExtras) MglExtras.bindBackups(content);
     bindCustomCard();
     bindSettingsData();
     bindDebugCard();
@@ -6595,9 +6666,10 @@
     const ipc = getIpc();
     const r = await ipc.invoke('crash:read', name).catch(() => null);
     if (!r || !r.ok) { toast('Не удалось открыть отчёт'); return; }
+    const hintsHtml = (r.hints || []).length ? `<div class="crash-hints"><div class="field-label">Возможные причины</div>${r.hints.map(h => `<div class="crash-hint"><b>${escapeHtml(h.title)}</b><span>${escapeHtml(h.hint)}</span></div>`).join('')}</div>` : '';
     const wrap = showModal({
       title: name, wide: true, okText: 'Скопировать',
-      bodyHtml: `<pre class="crash-text">${escapeHtml(r.text)}</pre>`,
+      bodyHtml: `${hintsHtml}<pre class="crash-text">${escapeHtml(r.text)}</pre>`,
       onOk: () => { toast(copyText(r.text) ? 'Отчёт скопирован' : 'Не удалось скопировать'); return false; }
     });
     wrap.querySelector('.modal-cancel').textContent = 'Закрыть';
@@ -6921,6 +6993,13 @@
     gameLog.badge = document.getElementById('game-log-badge');
     document.getElementById('game-log-close').addEventListener('click', () => setGameLogPanel(false));
     document.getElementById('game-log-clear').addEventListener('click', () => { gameLog.lines = []; renderGameLog(); });
+    document.getElementById('game-log-copy').addEventListener('click', async () => {
+      const text = gameLog.lines.map(l => l.text).join('\n');
+      let ok = false;
+      try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {}
+      if (!ok) { try { window.require('electron').clipboard.writeText(text); ok = true; } catch (e) {} }
+      toast(ok ? 'Лог скопирован' : 'Не удалось скопировать');
+    });
     document.getElementById('game-log-stop').addEventListener('click', () => {
       const ipc = getIpc();
       if (ipc && gameLog.activeFolder) { ipc.invoke('mc:stop', gameLog.activeFolder); toast('Останавливаю игру…'); }
@@ -7173,6 +7252,14 @@
       if (ipc) ipc.send('app:busy', n);
     }
     function emit() { subs.forEach(fn => { try { fn(); } catch (e) {} }); render(); reportBusy(); }
+    // прогресс приходит очень часто - перерисовываем трей не чаще 4 раз в секунду (старт/финиш задач - сразу)
+    let _emitTimer = null, _lastEmit = 0;
+    function emitSoft() {
+      const wait = 250 - (Date.now() - _lastEmit);
+      if (wait <= 0) { _lastEmit = Date.now(); emit(); return; }
+      if (_emitTimer) return;
+      _emitTimer = setTimeout(() => { _emitTimer = null; _lastEmit = Date.now(); emit(); }, wait);
+    }
     function on(fn) { subs.push(fn); return () => { const i = subs.indexOf(fn); if (i >= 0) subs.splice(i, 1); }; }
     function all() { return Array.from(tasks.values()); }
     function active() { return all().filter(t => t.state === 'running'); }
@@ -7193,7 +7280,7 @@
       if (patch.progress != null) t.progress = patch.progress;
       if (patch.status != null && !t.cancelling) t.status = patch.status;
       if (patch.title) t.title = patch.title;
-      emit();
+      emitSoft();
     }
     function finish(id, { ok, error } = { ok: true }) {
       const t = tasks.get(id);

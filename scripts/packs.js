@@ -112,7 +112,7 @@
         <div class="page-head page-head-row"><div><div class="page-title">Сборки</div>
           <div class="page-sub">У каждой сборки своя папка <code class="path">.minecraft/instances/&lt;название&gt;</code> - моды, конфиги, миры. Версии игры общие</div></div>
           <div class="pk-head-actions">
-            <button class="btn-secondary" id="pk-import">${I.dl} Импорт .mrpack</button>
+            <button class="btn-secondary" id="pk-import">${I.dl} Импорт модпака</button>
             <button class="btn primary sm" data-pk-create>Создать сборку</button>
           </div></div>
         <div class="tab-row">${tabs}</div>
@@ -124,7 +124,7 @@
     const p = packById(S.packId);
     if (!p) return `<div class="view">${emptyHtml('Сборка не найдена', false)}</div>`;
     const run = isRunning(p);
-    const tabs = [['mod', 'Моды'], ['resourcepack', 'Ресурспаки'], ['shader', 'Шейдеры'], ['worlds', 'Миры'], ['browse', 'Добавить контент']]
+    const tabs = [['mod', 'Моды'], ['resourcepack', 'Ресурспаки'], ['shader', 'Шейдеры'], ['worlds', 'Миры'], ['shots', 'Скриншоты'], ['browse', 'Добавить контент']]
       .map(([k, l]) => `<button class="tab ${S.packTab === k ? 'active' : ''}" data-pk-ptab="${k}">${l}</button>`).join('');
     const warn = p.state === 'installing' ? `<div class="pk-warn">${I.info}<span>Сборка ещё устанавливается - прогресс в трее загрузок.</span></div>`
       : !p.ready ? `<div class="pk-warn bad">${I.warn}<span>Версия игры для сборки не установлена (${esc(p.mc)} ${esc(loaderText(p))}).</span><button class="btn-secondary" data-pk-repair="${esc(p.id)}">Восстановить версию</button></div>` : '';
@@ -149,7 +149,7 @@
         </div>
         ${warn}
         <div class="tab-row">${tabs}</div>
-        ${S.packTab === 'browse' ? '<div id="pk-browser"></div>' : S.packTab === 'worlds' ? worldsPaneHtml() : contentPaneHtml(S.packTab)}
+        ${S.packTab === 'browse' ? '<div id="pk-browser"></div>' : S.packTab === 'worlds' ? worldsPaneHtml() : S.packTab === 'shots' ? (window.MglExtras ? MglExtras.shotsPaneHtml() : '') : contentPaneHtml(S.packTab)}
       </div>`;
   };
   TITLES.packs = 'Сборки';
@@ -163,6 +163,7 @@
         <button class="btn-secondary" data-pkc-add>${I.plus} Добавить файлы</button>
         <button class="btn-secondary" data-pkc-all="1">Включить все</button>
         <button class="btn-secondary" data-pkc-all="0">Отключить все</button>
+        ${type === 'mod' ? '<button class="btn-secondary" data-pkc-updates>Обновления модов</button>' : ''}
         <button class="btn-secondary" data-pkc-folder>${I.folder} Папка ${TYPE_DIR[type]}</button>
         <input type="file" id="pkc-file" multiple hidden accept="${ext}">
       </div>
@@ -286,6 +287,8 @@
       toast(r && r.ok ? `Изменено: ${r.changed}` : 'Ошибка: ' + ((r && r.error) || ''));
       reload();
     }));
+    const updBtn = content.querySelector('[data-pkc-updates]');
+    if (updBtn) updBtn.addEventListener('click', () => window.MglExtras && MglExtras.checkUpdates({ instance: p.id, onDone: reload }));
     const folderBtn = content.querySelector('[data-pkc-folder]');
     if (folderBtn) folderBtn.addEventListener('click', () => ipc ? ipc.invoke('inst:openFolder', { id: p.id, sub: TYPE_DIR[type] }) : toast('Доступно в приложении'));
     const importPaths = async (paths) => {
@@ -329,7 +332,7 @@
     }
     const isPack = opts.mode === 'content';
     const types = isPack ? [['mod', 'Моды'], ['resourcepack', 'Ресурспаки'], ['shader', 'Шейдеры']] : [];
-    const verOpts = ['', '1.21.4', '1.21.1', '1.20.6', '1.20.4', '1.20.1', '1.19.4', '1.19.2', '1.18.2', '1.16.5', '1.12.2', '1.8.9'];
+    const verOpts = ['', '1.21.11', '1.21.4', '1.21.1', '1.20.6', '1.20.4', '1.20.1', '1.19.4', '1.19.2', '1.18.2', '1.16.5', '1.12.2', '1.8.9'];
     host.innerHTML = `
       <div class="browse-filters pk-filters">
         <input id="pkb-search" class="input" type="text" placeholder="${isPack ? 'Поиск модов, ресурспаков, шейдеров…' : 'Поиск модпаков на Modrinth…'}" value="${esc(B.query)}">
@@ -563,12 +566,12 @@
   async function importMrpack(file) {
     const ipc = getIpc();
     if (!ipc) { toast('Импорт доступен в приложении'); return; }
-    if (!file) file = await ipc.invoke('dialog:pickFile', { filters: [{ name: 'Modrinth modpack', extensions: ['mrpack'] }] });
+    if (!file) file = await ipc.invoke('dialog:pickFile', { filters: [{ name: 'Модпак (.mrpack, CurseForge .zip)', extensions: ['mrpack', 'zip'] }] });
     if (!file) return;
-    const info = await ipc.invoke('inst:peekMrpack', file);
-    if (!info || !info.ok) { toast('Не удалось прочитать .mrpack: ' + ((info && info.error) || '')); return; }
+    const info = await ipc.invoke('inst:peekPack', file);
+    if (!info || !info.ok) { toast('Не удалось прочитать модпак: ' + ((info && info.error) || '')); return; }
     showModal({
-      title: 'Импорт .mrpack',
+      title: info.kind === 'curse' ? 'Импорт модпака CurseForge' : 'Импорт .mrpack',
       bodyHtml: `
         <div class="field"><label class="field-label">Название сборки</label><input type="text" id="pki-name" maxlength="60" value="${esc(info.name || '')}"></div>
         <div class="field-hint">${esc(info.summary || '')}<br>Minecraft <b>${esc(info.mc)}</b> · ${esc(info.loader === 'vanilla' ? 'Vanilla' : (LOADER[info.loader] || info.loader) + ' ' + (info.loaderVersion || ''))} · файлов: ${info.files}</div>`,
@@ -576,9 +579,13 @@
       onOk: (m) => {
         const name = m.querySelector('#pki-name').value.trim();
         toast('Импортирую модпак - прогресс в трее загрузок');
-        ipc.invoke('inst:importMrpack', { file, name }).then(async r => {
+        ipc.invoke(info.kind === 'curse' ? 'inst:importCurse' : 'inst:importMrpack', { file, name }).then(async r => {
           await loadPacks();
-          if (r && r.ok) toast(`Сборка «${r.instance.name}» импортирована`);
+          if (r && r.ok) {
+            toast(`Сборка «${r.instance.name}» импортирована`);
+            const sk = (r.instance && r.instance.skipped) || [];
+            if (sk.length) U.showNoticePlate(`Не удалось скачать модов: ${sk.length} (у части CurseForge запрещает загрузку вне сайта). Добавьте их вручную.`);
+          }
           else if (r && r.cancelled) toast('Импорт отменён');
           else toast('Не удалось импортировать: ' + ((r && r.error) || ''));
           rerender();
@@ -667,13 +674,20 @@
           ${javas.map(j => `<option value="${esc(j.path)}" ${j.path === cur ? 'selected' : ''}>Java ${j.major} · ${esc(j.vendor)} · ${esc(j.path)}</option>`).join('')}
           ${cur && !javas.some(j => j.path === cur) ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : ''}
         </select></div>
+        <div class="field"><label class="field-label">Доп. JVM-аргументы сборки (добавляются к общим)</label><input type="text" id="pks-jvm" value="${esc(p.jvmArgs || '')}" placeholder="-XX:+UseG1GC" spellcheck="false"></div>
+        <div class="field"><label class="field-label">Разрешение окна (пусто - как в настройках)</label>
+          <div class="field-row"><input type="number" id="pks-w" min="320" placeholder="ширина" value="${p.resolution ? p.resolution.width : ''}"><input type="number" id="pks-h" min="240" placeholder="высота" value="${p.resolution ? p.resolution.height : ''}"></div></div>
+        <div class="field"><label class="field-label">Полный экран</label><select id="pks-fs"><option value="">Как в настройках</option><option value="1" ${p.fullscreen === true ? 'selected' : ''}>Да</option><option value="0" ${p.fullscreen === false ? 'selected' : ''}>Нет</option></select></div>
         <div class="field-hint">Папка сборки: <code class="path">${esc(p.dir || '.minecraft/instances/' + p.id)}</code> - переименование её не меняет.</div>`,
       okText: 'Сохранить',
       onOk: async (m) => {
         if (!ipc) { toast('Доступно в приложении'); return true; }
         const mem = parseInt(m.querySelector('#pks-mem').value, 10);
         const r = await ipc.invoke('inst:update', { id: p.id, patch: {
-          name: m.querySelector('#pks-name').value, memory: mem >= 512 ? mem : null, javaPath: m.querySelector('#pks-java').value || null } });
+          name: m.querySelector('#pks-name').value, memory: mem >= 512 ? mem : null, javaPath: m.querySelector('#pks-java').value || null,
+          jvmArgs: m.querySelector('#pks-jvm').value,
+          resolution: { width: m.querySelector('#pks-w').value, height: m.querySelector('#pks-h').value },
+          fullscreen: m.querySelector('#pks-fs').value === '' ? null : m.querySelector('#pks-fs').value === '1' } });
         if (!r || !r.ok) { toast('Ошибка: ' + ((r && r.error) || '')); return false; }
         await loadPacks(); rerender(); toast('Сохранено');
         return true;
@@ -798,7 +812,7 @@
       if (imp) imp.addEventListener('click', () => importMrpack(null));
       root.addEventListener('dragover', (e) => e.preventDefault());
       root.addEventListener('drop', (e) => {
-        const f = Array.from(e.dataTransfer.files || []).find(x => /\.mrpack$/i.test(x.name));
+        const f = Array.from(e.dataTransfer.files || []).find(x => /\.(mrpack|zip)$/i.test(x.name));
         if (f && f.path) { e.preventDefault(); importMrpack(f.path); }
       });
       if (S.tab === 'modpacks') mountBrowser({ mode: 'modpack' });
@@ -818,6 +832,7 @@
       root.querySelectorAll('[data-pk-ptab]').forEach(t => t.addEventListener('click', () => { S.packTab = t.dataset.pkPtab; U.setView('pack'); }));
       if (S.packTab === 'browse') mountBrowser({ mode: 'content', pack: p });
       else if (S.packTab === 'worlds') bindWorlds(p);
+      else if (S.packTab === 'shots') { if (window.MglExtras) MglExtras.bindShots(content, p.id); }
       else bindPackContent(p, S.packTab);
     }
   });
@@ -830,6 +845,6 @@
     if (d && (d.status === 'Готово' || /^Ошибка/.test(d.status || ''))) loadPacks().then(() => { if (U.currentView === 'packs' || (U.currentView === 'pack' && S.packId === d.id)) rerender(); });
   });
 
-  window.MglPacks = { load: loadPacks, open: openPack, create: createModal, importMrpack, state: S };
+  window.MglPacks = { load: loadPacks, open: openPack, create: createModal, importMrpack, installModpack: modpackModal, state: S };
   loadPacks();
 })();

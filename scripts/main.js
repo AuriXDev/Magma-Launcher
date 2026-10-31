@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, net, Tray, Menu, nativeImage, session, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, net, Tray, Menu, nativeImage, session, desktopCapturer, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -828,6 +828,7 @@ async function startManagedServer(id) {
           buf = buf.slice(i + 1);
           if (!line) continue;
           srvLog(id, line, label);
+          try { extras.onServerLine(id, line); } catch (err) {}
           if (proc.state === 'starting' && /Done \(\d/.test(line)) {
             const props = readServerProps(id);
             srvState(id, 'running', { port: +(props['server-port'] || 25565) });
@@ -846,6 +847,7 @@ async function startManagedServer(id) {
     child.on('exit', (code) => {
       clearTimeout(proc.killTimer);
       serverProcs.delete(id);
+      try { extras.onServerStopped(id); } catch (err) {}
       srvLog(id, `Процесс завершён (код ${code})`, 'system');
       srvState(id, 'stopped', { code, crashed: !proc.stopping && code !== 0 });
       if (proc.restart) setTimeout(() => startManagedServer(id), 600);
@@ -889,6 +891,14 @@ ipcMain.handle('srv:clearLog', (e, id) => { serverLogs.set(id, []); return { ok:
 ipcMain.handle('srv:status', () => Array.from(serverProcs.entries()).map(([id, p]) => ({
   id, state: p.state, pid: p.child ? p.child.pid : null, startedAt: p.startedAt
 })));
+const extras = require('./extras')({
+  ipcMain, shell, clipboard, nativeImage, settings, minecraftDir: () => minecraftDir(), instances, sendRenderer: (ch, d) => sendRenderer(ch, d),
+  httpsJson: (u) => httpsJson(u), httpsPost: (u, b) => httpsPost(u, b), downloadFile: (u, d2, p) => downloadFile(u, d2, p),
+  contentRoot, contentDirFor, readContentIndex, writeContentIndex, serverProcs, managedEntry, managedDir, srvLog,
+  startManagedServer, stopManagedServer,
+  isGameRunning: (id, scope) => manager.getRunning().some(r => scope === 'g' ? !String(r.folder).startsWith('inst:') : r.folder === 'inst:' + id)
+});
+
 function lanAddress() {
   const VIRTUAL = /vethernet|wsl|hyper-v|docker|virtualbox|vmware|vbox|loopback|tailscale|zerotier|hamachi|radmin|xray|happ|v2ray|vpn|wintun|wireguard|tap-|tun\d|outline/i;
   const real = [], virt = [];
@@ -943,6 +953,9 @@ ipcMain.handle('srv:updateManaged', (e, { id, patch }) => {
   if (p.memory) it.memory = Math.max(512, parseInt(p.memory, 10) || 1024);
   if (typeof p.jvmArgs === 'string') it.jvmArgs = p.jvmArgs;
   if (typeof p.name === 'string' && p.name.trim()) it.name = p.name.trim();
+  if ('autoStart' in p) it.autoStart = !!p.autoStart;
+  if ('restartHours' in p) it.restartHours = Math.max(0, Math.min(168, +p.restartHours || 0));
+  if ('backupHours' in p) it.backupHours = Math.max(0, Math.min(168, +p.backupHours || 0));
   settings.update({ managedServers: list }); settings.save();
   return { ok: true, entry: it };
 });
@@ -1009,9 +1022,15 @@ function downloadFile(url, dest, onProgress) {
       const total = parseInt(res.headers['content-length'] || '0', 10);
       try { fs.mkdirSync(path.dirname(dest), { recursive: true }); } catch (e) {}
       const out = fs.createWriteStream(dest);
-      let done = 0;
-      res.on('data', c => { done += c.length; onProgress && onProgress(done, total); out.write(Buffer.from(c)); });
-      res.on('end', () => { out.end(() => resolve()); });
+      let done = 0, lastTick = 0;
+      res.on('data', c => {
+        done += c.length;
+        // прогресс - не чаще ~7 раз в секунду: иначе тысячи IPC-сообщений в секунду забивают окно («не отвечает») и грузят процессор
+        if (onProgress) { const now = Date.now(); if (now - lastTick >= 150) { lastTick = now; onProgress(done, total); } }
+        // backpressure: не копим весь файл в памяти, пока диск не успевает
+        if (out.write(c) === false) { res.pause(); out.once('drain', () => res.resume()); }
+      });
+      res.on('end', () => { if (onProgress) onProgress(done, total); out.end(() => resolve()); });
       res.on('error', reject);
       out.on('error', reject);
     });
@@ -1634,10 +1653,46 @@ function instanceInfo(folder) {
 
 const MGL_SC_DIR = path.join(__dirname, '..', 'assets', 'MGL');
 const MGL_NAME_RE = /^MGLskin[_\-\s]?(neoforge|forge|fabric|quilt)[_\-\s]?(\d+(?:\.\d+)*)\.jar$/i;
-function mglBundled() {
+const MGL_REPO = 'AuriXDev/MGLskin';
+// Обновлённые моды из репозитория лежат тут и перекрывают одноимённые из assets/MGL
+const mglCacheDir = () => path.join(app.getPath('userData'), 'mgl-sc');
+function mglScan(dir) {
   try {
-    return fs.readdirSync(MGL_SC_DIR).map(f => { const m = f.match(MGL_NAME_RE); return m ? { file: f, loader: m[1].toLowerCase(), mc: m[2], src: path.join(MGL_SC_DIR, f) } : null; }).filter(Boolean);
+    return fs.readdirSync(dir).map(f => { const m = f.match(MGL_NAME_RE); return m ? { file: f, loader: m[1].toLowerCase(), mc: m[2], src: path.join(dir, f) } : null; }).filter(Boolean);
   } catch (e) { return []; }
+}
+function mglBundled() {
+  const by = new Map();
+  mglScan(MGL_SC_DIR).forEach(a => by.set(a.file, a));
+  mglScan(mglCacheDir()).forEach(a => by.set(a.file, a));
+  return Array.from(by.values());
+}
+const gitBlobSha = (buf) => require('crypto').createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${buf.length}\0`), buf])).digest('hex');
+let _mglUpdating = null;
+// Сверяет моды с корнем репозитория (git blob sha) и докачивает изменившиеся/новые
+function mglUpdateFromRepo() {
+  if (_mglUpdating) return _mglUpdating;
+  _mglUpdating = (async () => {
+    const list = await httpsJson(`https://api.github.com/repos/${MGL_REPO}/contents/`);
+    if (!Array.isArray(list)) throw new Error('Неожиданный ответ GitHub');
+    const local = new Map(mglBundled().map(a => [a.file, a]));
+    const updated = [];
+    for (const it of list) {
+      if (it.type !== 'file' || !MGL_NAME_RE.test(it.name) || !it.download_url) continue;
+      const cur = local.get(it.name);
+      if (cur) { try { if (gitBlobSha(fs.readFileSync(cur.src)) === it.sha) continue; } catch (e) {} }
+      const buf = await netBuffer(it.download_url);
+      if (gitBlobSha(buf) !== it.sha) { console.warn('[MGL2] MGL S&C: sha не совпал', it.name); continue; }
+      fs.mkdirSync(mglCacheDir(), { recursive: true });
+      const dest = path.join(mglCacheDir(), it.name);
+      fs.writeFileSync(dest + '.part', buf);
+      fs.renameSync(dest + '.part', dest);
+      updated.push(it.name);
+    }
+    if (updated.length && settings.get('useMglSc')) { try { mglEnsureCopies(); } catch (e) {} }
+    return { ok: true, updated, mods: mglBundled().map(a => ({ file: a.file, loader: a.loader, mc: a.mc })) };
+  })().catch(err => ({ ok: false, error: err.message })).finally(() => { _mglUpdating = null; });
+  return _mglUpdating;
 }
 function mglEnsureCopies(modsDir) {
   const dir = modsDir || contentDirFor('mod');
@@ -1646,9 +1701,8 @@ function mglEnsureCopies(modsDir) {
   mglBundled().forEach(a => {
     const live = path.join(dir, a.file), off = live + '.disabled';
     try {
-      const size = fs.statSync(a.src).size;
       const cur = fs.existsSync(live) ? live : fs.existsSync(off) ? off : null;
-      if (cur && fs.statSync(cur).size === size) return;
+      if (cur && fs.readFileSync(cur).equals(fs.readFileSync(a.src))) return;
       fs.copyFileSync(a.src, cur || off);
       copied++;
     } catch (e) { console.warn('[MGL2] MGL S&C copy', a.file, e.message); }
@@ -1710,7 +1764,8 @@ ipcMain.handle('mglsc:set', (e, enabled) => {
     return { ok: true, ...mglRemoveAll(), mods: [] };
   } catch (err) { return { ok: false, error: err.message }; }
 });
-ipcMain.handle('mglsc:info', () => ({ enabled: !!settings.get('useMglSc'), mods: mglBundled().map(a => ({ file: a.file, loader: a.loader, mc: a.mc })) }));
+ipcMain.handle('mglsc:update', () => mglUpdateFromRepo());
+ipcMain.handle('mglsc:info',() => ({ enabled: !!settings.get('useMglSc'), mods: mglBundled().map(a => ({ file: a.file, loader: a.loader, mc: a.mc })) }));
 ipcMain.handle('mc:reinstall', async (e, folder) => {
   const send = (progress, status) => sendRenderer('mc:reinstallProgress', { folder, progress, status });
   const base = path.resolve(path.join(minecraftDir(), 'versions'));
@@ -1944,8 +1999,22 @@ ipcMain.handle('settings:save', (e, patch) => {
 
 
 
+// События прогресса при установке идут сотнями в секунду (по файлу на ассет/библиотеку) - промежуточные
+// для одной и той же задачи прореживаем (≤ 10/с); финальные (100 %, ошибка, done) пропускаем всегда.
+const _progressSent = new Map();
 function sendRenderer(channel, payload) {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (/progress$/i.test(channel) && payload && typeof payload === 'object') {
+    const final = (payload.progress >= 100) || payload.done || /^Ошибка|^Готово/i.test(String(payload.status || ''));
+    if (!final) {
+      const key = channel + '|' + (payload.id || payload.slug || payload.folder || payload.loader || payload.major || '');
+      const now = Date.now();
+      if (now - (_progressSent.get(key) || 0) < 100) return;
+      _progressSent.set(key, now);
+      if (_progressSent.size > 200) _progressSent.clear();
+    }
+  }
+  mainWindow.webContents.send(channel, payload);
 }
 // gameDir - папка игры запуска (сборка или .minecraft): туда кладутся CustomSkinLoader/ и mgl/active.properties;
 // сама библиотека скинов всегда общая - <.minecraft>/mgl/skin|cape
@@ -1992,13 +2061,16 @@ function writeMglScActive(base, applied, outDir) {
 
 function buildLaunchOptions(override) {
   const o = settings.get('launchOptions') || {};
+  const inst = override && override.inst;
   let quickPlay = o.quickPlayType && o.quickPlayType !== 'none' && String(o.quickPlayValue || '').trim()
     ? { type: o.quickPlayType, value: String(o.quickPlayValue).trim() } : null;
   if (override && override.quickPlay) quickPlay = override.quickPlay;
   return {
-    extraJvmArgs: o.extraJvmArgs || '',
-    resolution: o.customResolution ? { width: o.width || 1280, height: o.height || 720 } : null,
-    fullscreen: !!o.fullscreen,
+    // у сборки свои параметры игры важнее общих: доп. JVM-аргументы дописываются, разрешение/полный экран заменяются
+    extraJvmArgs: [o.extraJvmArgs, inst && inst.jvmArgs].filter(Boolean).join(' '),
+    resolution: inst && inst.resolution && inst.resolution.width > 0 ? { width: inst.resolution.width, height: inst.resolution.height || 720 }
+      : (o.customResolution ? { width: o.width || 1280, height: o.height || 720 } : null),
+    fullscreen: inst && typeof inst.fullscreen === 'boolean' ? inst.fullscreen : !!o.fullscreen,
     quickPlay,
     wrapper: o.wrapper || '',
     preLaunch: o.preLaunch || '',
@@ -2049,12 +2121,16 @@ ipcMain.handle('mc:launch', async (e, args) => {
         } else sendRenderer('mc:log', { folder: key, stream: 'stdout', line: '[MGL S&C] включён ' + r.file });
       } catch (err) { console.warn('[MGL2] MGL S&C', err.message); }
     }
+    if (settings.get('autoBackupWorlds') !== false) {
+      send(11, 'Резервные копии миров…');
+      try { await extras.backupWorlds(gameDir || minecraftDir()); } catch (err) { console.warn('[MGL2] backup', err.message); }
+    }
     send(12, 'Подготовка скина/плаща…');
     const applied = applyActiveSkinCape(name, gameDir);
     if (applied.skin || applied.cape) {
       console.log('[MGL2] applied', applied);
     }
-    const launch = buildLaunchOptions({ quickPlay: quickPlay && quickPlay.type && quickPlay.value ? quickPlay : null });
+    const launch = buildLaunchOptions({ quickPlay: quickPlay && quickPlay.type && quickPlay.value ? quickPlay : null, inst });
     const ctx = { folder, instance: inst, gameDir: gameDir || minecraftDir(), username: name, memoryMax: mem, javaPath, launch, cancelled: null, cancel(reason) { this.cancelled = reason || 'Запуск отменён плагином'; } };
     await plugins.emit('launch:before', ctx);
     if (ctx.cancelled) throw new Error(ctx.cancelled);
@@ -2088,6 +2164,7 @@ ipcMain.handle('mc:launch', async (e, args) => {
         if (inst) instances.recordPlay(inst.id, addSec);
         sendRenderer('mc:exit', { ...info, playtimeSeconds: totalSec });
         plugins.emit('game:exit', { folder, ...info, version: folder, instance: inst && inst.id, playtimeSeconds: totalSec });
+        if (settings.get('autoBackupWorlds') !== false) extras.backupWorlds(gameDir || minecraftDir()).catch(() => {});
         try { restoreWindowAfterGame(); } catch (e) { console.warn('[MGL2] restoreWindow', e.message); }
       }
     });
@@ -2292,6 +2369,8 @@ app.whenReady().then(() => {
   plugins.boot();
   createWindow();
   crashReporter.note(`Лаунчер ${app.getVersion()} запущен`);
+  extras.startScheduler();
+  setTimeout(() => { mglUpdateFromRepo().then(r => { if (r && r.ok && r.updated.length) { console.log('[MGL2] MGL S&C обновлён:', r.updated.join(', ')); sendRenderer('mglsc:updated', r); } }); }, 5000);
   setTimeout(() => { try { rotateGameLogs(); } catch (e) { console.warn('[MGL2] rotateGameLogs', e.message); } }, 8000);
 });
 app.on('will-quit', () => { plugins.emitSync('app:quit', {}); plugins.unloadAll(); plugins.clearLock(); });
@@ -2309,7 +2388,7 @@ ipcMain.handle('crash:list', () => ({
   items: crashReporter.list(), dir: crashReporter.dir,
   enabled: settings.get('crashReports') !== false, seenTs: settings.get('crashSeenTs') || 0
 }));
-ipcMain.handle('crash:read', (e, name) => { try { return { ok: true, text: crashReporter.read(name) }; } catch (err) { return { ok: false, error: err.message }; } });
+ipcMain.handle('crash:read', (e, name) => { try { const text = crashReporter.read(name); return { ok: true, text, hints: extras.analyzeCrash(text) }; } catch (err) { return { ok: false, error: err.message }; } });
 ipcMain.handle('crash:remove', (e, name) => ({ ok: crashReporter.remove(name) }));
 ipcMain.handle('crash:clear', () => { crashReporter.clear(); return { ok: true }; });
 ipcMain.handle('crash:seen', () => { settings.update({ crashSeenTs: Date.now() }); settings.save(); return { ok: true }; });
