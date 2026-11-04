@@ -117,6 +117,19 @@ docs/                 плагины, политика, условия
 
 Magma Launcher не является продуктом Mojang Studios или Microsoft и не одобрен ими. «Minecraft» - товарный знак Mojang Studios / Microsoft.
 
+## Системные требования
+
+### Минимальные
+- windows 10 x64 / Linux
+- ram 2 GB
+- CPU 1 GHz
+
+### Рекомендованные
+- windows 10-11 x64 / Linux
+- ram 4 GB
+- CPU 2,5 GHz
+- Встроенное графическое ядро
+
 ## Контакты
 
 Telegram: **@VuaTrix**
