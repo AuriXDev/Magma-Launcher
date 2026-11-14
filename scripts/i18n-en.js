@@ -158,7 +158,7 @@
   "Шейдеры с Modrinth. Устанавливаются в .minecraft/shaderpacks/": "Shaders from Modrinth. Installed to .minecraft/shaderpacks/",
   "Модпаки с Modrinth. Пока только ссылка на страницу проекта": "Modpacks from Modrinth. For now only a link to the project page",
   "Модпаки с Modrinth. Устанавливаются отдельной сборкой, свой .mrpack можно импортировать кнопкой справа": "Modpacks from Modrinth. Installed as a separate instance; import your own .mrpack with the button on the right",
-  "Проверить обновления мода": "Check for mod updates",
+  "Переустановить MGL S&C": "Reinstall MGL S&C",
   "Обновление доступно в приложении": "Updating is available in the app",
   "Не удалось проверить обновления MGL S&C: ": "Failed to check MGL S&C updates: ",
   "MGL S&C обновлён: ": "MGL S&C updated: ",

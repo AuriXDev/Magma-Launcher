@@ -52,7 +52,7 @@
 
   const NEWS_URL = 'https://gist.githubusercontent.com/AuriXDev/664e23438029adb3993d89fa2213dbfe/raw/data.json';
   const NEWS_REFRESH_MS = 20 * 60 * 1000;
-  const LAUNCHER_VERSION = '2.0.3';
+  const LAUNCHER_VERSION = '2.0.4';
   let _newsItems = [];
   let _newsLoaded = false;
   let _remoteMeta = { latestVersion: null, updateRepo: null };
@@ -901,8 +901,7 @@
           <div class="field"><label class="field-label">Никнейм</label>
             <input type="text" id="set-username" value="${escapeHtml(s.username || D.profile.name)}"></div>
           <div class="toggle-row"><div><div class="tl">Использовать MGL S&amp;C</div><div class="ts">Локальная смена скинов и плащей в игре с помощью мода Magma Skin &amp; Cape</div>
-            <div class="ts mglsc-versions" id="mglsc-versions"></div>
-            <div class="ts"><a href="#" id="mglsc-update">Проверить обновления мода</a></div></div>
+            <div class="ts"><a href="#" id="mglsc-update">Переустановить MGL S&amp;C</a></div><div id="mglsc-progress" class="hidden" role="status" aria-live="polite"><div id="mglsc-progress-text" class="ts"></div><progress id="mglsc-progress-bar" max="100" value="0"></progress></div></div>
             <div class="switch ${s.useMglSc ? 'on' : ''}" id="mglsc-switch"></div></div>
         </div>
         <div class="settings-card">
@@ -1031,7 +1030,7 @@
       .map(([v, l]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${escapeHtml(l)}</option>`).join('');
     const rows = SE.EVENTS.map(e => `<div class="season-row ${auto && auto.id === e.id ? 'on' : ''}">
         <span class="season-name">${escapeHtml(e.name)}</span>
-        <span class="season-dates">${fmt(e.from)} - ${fmt(e.to)}</span>
+        <span class="season-dates">${fmt(e.from)} - ${fmt(e.to)}${e.year ? ' ' + e.year : ''}</span>
         <span class="season-desc">${escapeHtml(e.desc)}</span>
         <button class="btn-ghost season-try" data-season-try="${e.id}">Показать</button></div>`).join('');
     const dens = s.seasonDensity || 1;
@@ -2896,12 +2895,14 @@
     const s = D.settings || {}, p = uiPrefs();
     // «Отключить сезонные эффекты», «без анимаций» и режим оптимизации гасят всё, включая эффект из дебага
     // (поздравление в ДР остаётся).
-    MglSeasonal.apply({
+    const season = {
       effects: !p.noSeasonal && !p.noAnimations,
       override: s.seasonOverride || '',
       date: s.seasonDate || '',
       density: s.seasonDensity || 1
-    });
+    };
+    try { localStorage.setItem('mgl.splashSeason', JSON.stringify(season)); } catch (e) {}
+    MglSeasonal.apply(season);
   }
   function uiPrefToggle(key, title, sub, s) {
     return `<div class="toggle-row"><div><div class="tl">${title}</div>${sub ? `<div class="ts">${sub}</div>` : ''}</div>
@@ -5950,23 +5951,51 @@
     mods.forEach(m => (by[m.loader] = by[m.loader] || []).push(m.mc));
     return 'Доступно: ' + Object.keys(by).map(l => `${LOADER_NAMES[l] || l} ${by[l].sort((a, b) => cmpVer(a, b)).join(', ')}`).join(' · ');
   }
+  let mglReinstallBusy = false;
+  let mglReinstallProgress = null;
+  let mglReinstallHideTimer = null;
+  function showMglReinstallProgress(data) {
+    mglReinstallProgress = data;
+    const box = content.querySelector('#mglsc-progress');
+    if (!box) return;
+    box.classList.remove('hidden');
+    box.querySelector('#mglsc-progress-text').textContent = data.status + ' (' + data.progress + '%)';
+    box.querySelector('#mglsc-progress-bar').value = data.progress;
+  }
   async function bindMglSc() {
     const sw = content.querySelector('#mglsc-switch');
     const info = content.querySelector('#mglsc-versions');
     if (!sw) return;
     const ipc = getIpc();
     if (ipc && info) { try { info.textContent = mglVersionsText((await ipc.invoke('mglsc:info')).mods); } catch (e) {} }
+    if (mglReinstallProgress) showMglReinstallProgress(mglReinstallProgress);
     const upd = content.querySelector('#mglsc-update');
     if (upd) upd.addEventListener('click', async (e) => {
       e.preventDefault();
       if (!ipc) { toast('Обновление доступно в приложении'); return; }
-      if (upd.dataset.busy) return;
-      upd.dataset.busy = '1';
-      const r = await ipc.invoke('mglsc:update').catch(err => ({ ok: false, error: err.message }));
-      delete upd.dataset.busy;
-      if (!r || !r.ok) { toast('Не удалось проверить обновления MGL S&C: ' + ((r && r.error) || '')); return; }
+      if (mglReinstallBusy) return;
+      mglReinstallBusy = true;
+      clearTimeout(mglReinstallHideTimer);
+      showMglReinstallProgress({ status: 'Подготовка…', progress: 0 });
+      const onProgress = (event, data) => showMglReinstallProgress(data);
+      ipc.on('mglsc:reinstallProgress', onProgress);
+      const r = await ipc.invoke('mglsc:reinstall').catch(err => ({ ok: false, error: err.message }));
+      ipc.removeListener('mglsc:reinstallProgress', onProgress);
+      mglReinstallBusy = false;
+      if (!r || !r.ok) {
+        showMglReinstallProgress({ status: 'Ошибка: ' + ((r && r.error) || ''), progress: 0 });
+        toast('Не удалось переустановить MGL S&C: ' + ((r && r.error) || ''));
+        return;
+      }
+      showMglReinstallProgress({ status: 'Готово', progress: 100 });
+      mglReinstallHideTimer = setTimeout(() => {
+        mglReinstallProgress = null;
+        const progress = content.querySelector('#mglsc-progress');
+        if (progress) progress.classList.add('hidden');
+        mglReinstallHideTimer = null;
+      }, 5000);
       if (info) info.textContent = mglVersionsText(r.mods);
-      toast(r.updated.length ? `MGL S&C обновлён: ${r.updated.join(', ')}` : 'Установлены все версии MGL S&C');
+      toast('MGL S&C переустановлен');
     });
     sw.addEventListener('click', async () => {
       if (sw.dataset.busy) return;

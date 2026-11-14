@@ -1765,6 +1765,55 @@ ipcMain.handle('mglsc:set', (e, enabled) => {
   } catch (err) { return { ok: false, error: err.message }; }
 });
 ipcMain.handle('mglsc:update', () => mglUpdateFromRepo());
+ipcMain.handle('mglsc:reinstall', async () => {
+  if (_mglUpdating) return { ok: false, error: 'Другая операция MGL S&C уже выполняется' };
+  _mglUpdating = (async () => {
+    const target = mglCacheDir();
+    const parent = path.dirname(target);
+    fs.mkdirSync(parent, { recursive: true });
+    const staging = fs.mkdtempSync(path.join(parent, 'mgl-sc-download-'));
+    const backup = staging + '-backup';
+    let moved = false;
+    try {
+      const files = [];
+      sendRenderer('mglsc:reinstallProgress', { status: 'Получение списка файлов…', progress: 0 });
+      async function downloadDirectory(api, relative = '') {
+        const entries = await httpsJson(api);
+        if (!Array.isArray(entries)) throw new Error('Неожиданный ответ GitHub');
+        for (const entry of entries) {
+          if (!entry.name || entry.name === '.' || entry.name === '..' || /[\\/]/.test(entry.name)) throw new Error('Недопустимое имя файла');
+          const next = path.join(relative, entry.name);
+          if (entry.type === 'dir') {
+            fs.mkdirSync(path.join(staging, next), { recursive: true });
+            await downloadDirectory(entry.url, next);
+          } else if (entry.type === 'file' && entry.download_url) {
+            files.push({ entry, next });
+          } else {
+            throw new Error('Неподдерживаемый элемент репозитория: ' + entry.name);
+          }
+        }
+      }
+      await downloadDirectory(`https://api.github.com/repos/${MGL_REPO}/contents/`);
+      for (let i = 0; i < files.length; i++) {
+        const { entry, next } = files[i];
+        sendRenderer('mglsc:reinstallProgress', { status: `Скачивание ${i + 1} из ${files.length}: ${entry.name}`, progress: Math.floor(i / files.length * 100) });
+        const data = await netBuffer(entry.download_url);
+        if (entry.sha && gitBlobSha(data) !== entry.sha) throw new Error('Ошибка проверки файла ' + entry.name);
+        fs.writeFileSync(path.join(staging, next), data);
+      }
+      sendRenderer('mglsc:reinstallProgress', { status: 'Установка файлов…', progress: 99 });
+      if (fs.existsSync(target)) { fs.renameSync(target, backup); moved = true; }
+      try { fs.renameSync(staging, target); }
+      catch (err) { if (moved) fs.renameSync(backup, target); moved = false; throw err; }
+      if (moved) fs.rmSync(backup, { recursive: true, force: true });
+      if (settings.get('useMglSc')) mglEnsureCopies();
+      return { ok: true };
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+    }
+  })().catch(err => ({ ok: false, error: err.message })).finally(() => { _mglUpdating = null; });
+  return _mglUpdating;
+});
 ipcMain.handle('mglsc:info',() => ({ enabled: !!settings.get('useMglSc'), mods: mglBundled().map(a => ({ file: a.file, loader: a.loader, mc: a.mc })) }));
 ipcMain.handle('mc:reinstall', async (e, folder) => {
   const send = (progress, status) => sendRenderer('mc:reinstallProgress', { folder, progress, status });

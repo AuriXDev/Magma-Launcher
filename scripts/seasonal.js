@@ -5,6 +5,7 @@
 
   // Порядок = приоритет: первое подходящее по дате событие побеждает (зима - самая общая, в конце).
   const EVENTS = [
+    { id: 'gta', name: 'GTA', year: 2026, from: '11-17', to: '11-25', desc: 'Заставка при запуске лаунчера', splash: 'gta-splash-preview.html#launcher' },
     { id: 'valentine', name: 'День святого Валентина', from: '02-10', to: '02-15', desc: 'Падающие сердечки' },
     { id: 'newyear', name: 'Новый год', from: '12-20', to: '01-10', desc: 'Снег и гирлянда сверху окна' },
     { id: 'march8', name: '8 Марта', from: '03-06', to: '03-09', desc: 'Лепестки цветов' },
@@ -20,8 +21,9 @@
     return from <= to ? (md >= from && md <= to) : (md >= from || md <= to);
   }
   function detect(date) {
-    const md = mmdd(date || new Date());
-    return EVENTS.find(e => inRange(md, e.from, e.to)) || null;
+    const day = date || new Date();
+    const md = mmdd(day);
+    return EVENTS.find(e => (!e.year || day.getFullYear() === e.year) && inRange(md, e.from, e.to)) || null;
   }
   function parseDate(str) {
     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str || '');
@@ -540,14 +542,16 @@
       override ('' = авто по дате, 'off', или id события), date ('YYYY-MM-DD' - симуляция даты),
       density (множитель 0.2..3). */
   let lastDate = new Date(), evId = null;
+  function selectEvent(opts) {
+    if (opts.override === 'off') return null;
+    return EVENTS.find(e => e.id === opts.override) || detect(parseDate(opts.date));
+  }
   function apply(opts) {
     const o = opts || {};
     const date = parseDate(o.date) || new Date();
-    let ev = null;
-    if (o.override === 'off') ev = null;
-    else if (o.override && SCENES[o.override]) ev = EVENTS.find(e => e.id === o.override);
-    else ev = detect(date);
-    if (!ev) { stop(); evId = null; return null; }
+    const ev = selectEvent(o);
+    document.body.classList.toggle('season-newyear', !!o.effects && !!ev && ev.id === 'newyear');
+    if (!ev || ev.splash) { stop(); evId = null; return ev; }
     const sc = SCENES[ev.id];
     lastDate = date;
     if (evId !== ev.id) { evId = ev.id; if (sc.greet) sc.greet(!!o.override, date); }
@@ -571,5 +575,5 @@
   // В фоне вкладки rAF и так спит; при возврате не «прыгаем» на большой dt
   document.addEventListener('visibilitychange', () => { last = performance.now(); });
 
-  window.MglSeasonal = { EVENTS, detect, apply, replay, parseDate, current: () => active };
+  window.MglSeasonal = { EVENTS, detect, selectEvent, apply, replay, parseDate, current: () => active };
 })();

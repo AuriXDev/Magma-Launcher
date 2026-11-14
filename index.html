@@ -7,6 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles/style.css">
+  <script src="scripts/seasonal.js"></script>
   <script src="scripts/themes.js"></script>
   <script src="scripts/i18n-en.js"></script>
   <script src="scripts/i18n.js"></script>
@@ -22,6 +23,20 @@
   <script>
     try { if (localStorage.getItem('mgl.splashStatic') === '1') document.getElementById('splash').classList.add('static'); } catch (e) {}
     (function () {
+      var prefs = {};
+      try { prefs = JSON.parse(localStorage.getItem('mgl.splashSeason')) || {}; } catch (e) {}
+      var event = window.MglSeasonal.selectEvent(prefs);
+      if (prefs.effects !== false && event && event.splash) {
+        var splash = document.getElementById('splash');
+        var art = document.createElement('iframe');
+        art.src = event.splash;
+        art.tabIndex = -1;
+        art.setAttribute('aria-hidden', 'true');
+        art.className = 'season-splash-art';
+        splash.classList.add('season-splash');
+        splash.prepend(art);
+        return;
+      }
       var box = document.getElementById('splash-matrix');
       if (!box) return;
       var M = ['10001', '11011', '10101', '10001', '11011'], N = 9, off = 2, html = '';
@@ -36,6 +51,7 @@
   </script>
   <div class="app-bg hidden" id="app-bg"></div>  <div class="rail">
     <div class="rail-mark" title="Magma Launcher">
+      <img class="rail-mark-newyear" src="assets/images/logo-newyear.png" alt="" aria-hidden="true">
       <svg viewBox="0 0 5 5" shape-rendering="crispEdges" aria-hidden="true">
         <path class="rm-r0" d="M0 0h1v1H0zM4 0h1v1H4z"/>
         <path class="rm-r1" d="M0 1h2v1H0zM3 1h2v1H3z"/>
@@ -252,7 +268,6 @@
   <script src="scripts/vendor/skinview3d.bundle.js"></script>
   <script src="scripts/obj-scene.js"></script>
   <script src="scripts/custom-select.js"></script>
-  <script src="scripts/seasonal.js"></script>
   <script src="scripts/mgl-egg.js"></script>
   <script src="scripts/ui.js"></script>
   <script src="scripts/packs.js"></script>
