@@ -7,6 +7,7 @@
 **Бесплатный неофициальный лаунчер Minecraft на Electron: сборки, моды, серверы, скины и плагины в одном окне.**
 
 [Скачать](https://github.com/AuriXDev/Magma-Launcher/releases/latest) ·
+[Telegram](https://t.me/mglauncher) ·
 [Плагины](docs/PLUGINS.md) ·
 [Конфиденциальность](docs/PRIVACY_POLICY.md) ·
 [Условия](docs/TERMS_OF_SERVICE.md)
