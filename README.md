@@ -121,6 +121,7 @@ Magma Launcher не является продуктом Mojang Studios или Mi
 ## Контакты
 
 Telegram: **@VuaTrix**
+Бот поддержки в Telegram: **@mglauncherbot**
 
 ---
 
